@@ -114,7 +114,7 @@ def create_individual_well_kinetics(df_pre, df_post, labels_matrix, fc_matrix):
                     spine.set_linewidth(1.2)
             
             if col_idx == 0:
-                ax.set_ylabel('Abs', fontsize=8)
+                ax.set_ylabel('RLU', fontsize=8)
             if row_idx == 7:
                 ax.set_xlabel('Time', fontsize=8)
             
