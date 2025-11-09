@@ -8,18 +8,24 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+from scipy.optimize import curve_fit
 import tempfile
 import os
 import matplotlib.pyplot as plt
 import matplotlib
+
 matplotlib.use('Agg')
 import pickle
+import matplotlib.pyplot as plt
+import numpy as np
 
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, PageBreak, Image, Spacer
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import landscape, A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
+from matplotlib.ticker import FuncFormatter
+from io import BytesIO
 
 # Vessel protocols lookup table
 VESSEL_PROTOCOLS = {
@@ -79,6 +85,127 @@ VESSEL_PROTOCOLS = {
     }
 }
 
+
+# EC50 Calculation Functions
+def three_param_logistic(log_conc, bottom, top, log_ec50):
+    """Three-parameter logistic equation (fixed Hill slope = 1.0)"""
+    return bottom + (top - bottom) / (1 + 10 ** (log_ec50 - log_conc))
+
+
+def fit_dose_response_curve(concentrations, responses):
+    """Fit three-parameter dose-response curve"""
+    try:
+        mask = ~(np.isnan(concentrations) | np.isnan(responses))
+        conc, resp = concentrations[mask], responses[mask]
+
+        if len(conc) < 3:
+            return None, None, None, None, None, None, False
+
+        log_conc = np.log10(conc)
+        bottom_guess, top_guess = np.min(resp), np.max(resp)
+        log_ec50_guess = np.median(log_conc)
+
+        popt, pcov = curve_fit(three_param_logistic, log_conc, resp,
+                               p0=[bottom_guess, top_guess, log_ec50_guess],
+                               maxfev=10000)
+
+        bottom, top, log_ec50 = popt
+        ec50 = 10 ** log_ec50
+
+        residuals = resp - three_param_logistic(log_conc, *popt)
+        ss_res, ss_tot = np.sum(residuals ** 2), np.sum((resp - np.mean(resp)) ** 2)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+
+        return ec50, log_ec50, top, bottom, r_squared, popt, True
+    except Exception as e:
+        print(f"Curve fitting failed: {e}")
+        return None, None, None, None, None, None, False
+
+
+def plot_dose_response_curve_compact(concentrations, responses, fit_params=None, ec50=None, width=4, height=3):
+    """
+    Compact, professional dose-response curve plot for Streamlit.
+    Parameters:
+        concentrations: np.array of concentrations (M)
+        responses: np.array of responses (fold change)
+        fit_params: fitted parameters for 3-param logistic (optional)
+        ec50: EC50 value for annotation (optional)
+        width, height: figure size in inches
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+    import numpy as np
+
+    fig, ax = plt.subplots(figsize=(width, height), dpi=1200)
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('white')
+
+    # Filter out NaNs
+    mask = ~(np.isnan(concentrations) | np.isnan(responses))
+    conc, resp = concentrations[mask], responses[mask]
+
+    # Fitted curve
+    if fit_params is not None:
+        log_conc_range = np.log10(conc.max()) - np.log10(conc.min())
+        log_conc_smooth = np.linspace(
+            np.log10(conc.min()) - 0.2 * log_conc_range,
+            np.log10(conc.max()) + 0.2 * log_conc_range, 1000
+        )
+        conc_smooth = 10 ** log_conc_smooth
+        resp_smooth = three_param_logistic(log_conc_smooth, *fit_params)
+        ax.plot(conc_smooth, resp_smooth, '-', linewidth=0.5,
+                color='#000000', zorder=1, solid_capstyle='round')  # Gradient-like blue
+
+    # Data points
+    ax.scatter(conc, resp, s=35, color='#000000', edgecolors='white', linewidth=0, zorder=3)
+
+    # Axes formatting
+    ax.set_xscale('log')
+    ax.set_xlabel('Log [M]', fontsize=8, fontweight='heavy', fontfamily='Inter', labelpad=3, color='#000000')
+    ax.set_ylabel('Response (Fold Change)', fontsize=8, fontweight='heavy', fontfamily='Inter', labelpad=1,
+                  color='#000000')
+
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['bottom'].set_linewidth(0.8)
+    ax.spines['left'].set_linewidth(0.8)
+
+    ax.tick_params(axis='both', which='major', labelsize=7, length=3, width=0.8, direction='out')
+    ax.tick_params(axis='both', which='minor', length=0)
+
+    # Log formatter
+    def log_m_formatter(x, pos):
+        exponent = int(np.log10(x))
+        return f'10$^{{{exponent}}}$'
+
+    ax.xaxis.set_major_formatter(FuncFormatter(log_m_formatter))
+
+    # Axis limits with small padding
+    x_min, x_max = conc.min(), conc.max()
+    log_range = np.log10(x_max / x_min)
+    ax.set_xlim(x_min * 10 ** (-0.05 * log_range), x_max * 10 ** (0.05 * log_range))
+    y_range = resp.max() - resp.min()
+    y_min = max(0, resp.min() - 0.05 * y_range)
+    ax.set_ylim(y_min, resp.max() + 0.05 * y_range)
+
+    # EC50 annotation
+    if ec50 is not None and fit_params is not None:
+        if ec50 < 1e-9:
+            ec50_text = f'{ec50 * 1e12:.1f} pM'
+        elif ec50 < 1e-6:
+            ec50_text = f'{ec50 * 1e9:.1f} nM'
+        elif ec50 < 1e-3:
+            ec50_text = f'{ec50 * 1e6:.1f} µM'
+        else:
+            ec50_text = f'{ec50 * 1e3:.1f} mM'
+        ax.text(0.98, 0.02, f'EC50 = {ec50_text}', transform=ax.transAxes, fontsize=8,
+                verticalalignment='bottom', horizontalalignment='right', color='#333333',
+                weight='heavy', fontfamily='Inter')
+
+    plt.tight_layout(pad=0.3)
+    return fig
+
+
 def save_analysis_state(export_df, df_pre, df_post, labels_matrix, fc_matrix, meta, excluded_wells):
     state = {
         'export_df': export_df,
@@ -92,6 +219,7 @@ def save_analysis_state(export_df, df_pre, df_post, labels_matrix, fc_matrix, me
     }
     return pickle.dumps(state)
 
+
 def load_analysis_state(uploaded_file):
     try:
         state = pickle.loads(uploaded_file.read())
@@ -100,27 +228,28 @@ def load_analysis_state(uploaded_file):
         st.error(f"Error loading analysis file: {e}")
         return None
 
+
 def analyze_replicates(export_df, excluded_wells=None):
     if excluded_wells is None:
         excluded_wells = {}
-    
+
     replicate_data = []
     grouped = export_df.groupby('Label')
-    
+
     for label, group in grouped:
         if label and label.strip() != '':
             excluded_for_label = excluded_wells.get(label, [])
             filtered_group = group[~group['Well'].isin(excluded_for_label)]
-            
+
             n_total = len(group)
             n_included = len(filtered_group)
-            
+
             if n_total > 1:
                 if n_included > 0:
                     mean_fc = filtered_group['Fold Change'].mean()
                     std_fc = filtered_group['Fold Change'].std() if n_included > 1 else 0
                     cv_percent = (std_fc / mean_fc * 100) if mean_fc != 0 else 0
-                    
+
                     wells_display = []
                     for _, row in group.iterrows():
                         well = row['Well']
@@ -128,7 +257,7 @@ def analyze_replicates(export_df, excluded_wells=None):
                             wells_display.append(f"~~{well}~~")
                         else:
                             wells_display.append(well)
-                    
+
                     fcs_display = []
                     for _, row in group.iterrows():
                         well = row['Well']
@@ -137,7 +266,7 @@ def analyze_replicates(export_df, excluded_wells=None):
                             fcs_display.append(f"~~{fc:.2f}~~")
                         else:
                             fcs_display.append(f"{fc:.2f}")
-                    
+
                     replicate_data.append({
                         'Label': label,
                         'n': f"{n_included}/{n_total}",
@@ -147,11 +276,12 @@ def analyze_replicates(export_df, excluded_wells=None):
                         'CV%': round(cv_percent, 1),
                         'Individual FCs': ', '.join(fcs_display)
                     })
-    
+
     if replicate_data:
         return pd.DataFrame(replicate_data)
     else:
         return None
+
 
 def process_sheet(xls, sheet_name):
     try:
@@ -168,42 +298,43 @@ def process_sheet(xls, sheet_name):
         st.error(f"Error reading {sheet_name}: {e}")
         return None, None
 
+
 def create_individual_well_kinetics(df_pre, df_post, labels_matrix, fc_matrix):
     fig, axes = plt.subplots(8, 12, figsize=(24, 14))
     fig.patch.set_facecolor('white')
-    
+
     wells = []
     for row in "ABCDEFGH":
         for col in range(1, 13):
             wells.append(f"{row}{col}")
-    
+
     highlighted_wells = []
-    
+
     for idx, well in enumerate(wells):
         row_idx = idx // 12
         col_idx = idx % 12
         ax = axes[row_idx, col_idx]
         ax.set_facecolor('white')
-        
+
         if well in df_pre.columns:
             fc = fc_matrix[row_idx, col_idx]
             is_highlighted = not pd.isna(fc) and fc > 2.0
-            
+
             if is_highlighted:
                 highlighted_wells.append(well)
                 ax.set_facecolor('#E8F5E9')
-            
-            ax.plot(df_pre['Time (min)'], df_pre[well], 
-                   'o-', linewidth=1, markersize=3, color='black', alpha=0.7)
-            ax.plot(df_post['Time (min)'], df_post[well], 
-                   's-', linewidth=2.5, markersize=4, color='black')
-            
+
+            ax.plot(df_pre['Time (min)'], df_pre[well],
+                    'o-', linewidth=1, markersize=3, color='black', alpha=0.7)
+            ax.plot(df_post['Time (min)'], df_post[well],
+                    's-', linewidth=2.5, markersize=4, color='black')
+
             label = labels_matrix[row_idx, col_idx]
             title = f"{well}: {label}" if label else well
-            
+
             if not pd.isna(fc):
                 title += f"\nFC: {fc:.2f}"
-            
+
             if is_highlighted:
                 ax.set_title(title, fontsize=9, fontweight='bold')
                 for spine in ax.spines.values():
@@ -214,66 +345,67 @@ def create_individual_well_kinetics(df_pre, df_post, labels_matrix, fc_matrix):
                 for spine in ax.spines.values():
                     spine.set_edgecolor('white')
                     spine.set_linewidth(1.2)
-            
+
             if col_idx == 0:
                 ax.set_ylabel('RLU', fontsize=8)
             if row_idx == 7:
                 ax.set_xlabel('Time', fontsize=8)
-            
+
             ax.tick_params(labelsize=7)
             ax.grid(True, alpha=0.3, linewidth=0.5)
         else:
             ax.axis('off')
-    
+
     legend_text = "● — Pre (thin)     ■ — Post (thick)     |     Green border & light fill: >2-fold activity"
     fig.text(0.5, 0.005, legend_text, ha='center', va='bottom',
              fontsize=12, family='monospace',
-             bbox=dict(boxstyle='round,pad=0.5', facecolor='white', 
-                      edgecolor='gray', linewidth=0.5, alpha=0.9))
-    
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='white',
+                       edgecolor='gray', linewidth=0.5, alpha=0.9))
+
     if highlighted_wells:
         note_text = f"Wells with >2-fold activity ({len(highlighted_wells)}): {', '.join(highlighted_wells)}"
-        fig.text(0.5, -0.015, note_text, ha='center', fontsize=10, 
-                style='italic', color='#2E7D32')
-    
+        fig.text(0.5, -0.015, note_text, ha='center', fontsize=10,
+                 style='italic', color='#2E7D32')
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.99])
-    
+
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     tmp.close()
     fig.savefig(tmp.name, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close(fig)
-    
+
     return tmp.name
+
 
 def create_fold_change_heatmap(fc_matrix, labels_matrix):
     fig, ax = plt.subplots(figsize=(16, 10))
     fig.patch.set_facecolor('white')
-    
+
     valid_fc = [fc_matrix[i, j] for i in range(8) for j in range(12) if not pd.isna(fc_matrix[i, j])]
     if valid_fc:
         vmin = min(valid_fc)
         vmax = max(valid_fc)
     else:
         vmin, vmax = 0.1, 10.0
-    
+
     from matplotlib.colors import TwoSlopeNorm
     norm = TwoSlopeNorm(vmin=vmin, vcenter=1.0, vmax=vmax)
-    
+
     im = ax.imshow(fc_matrix, cmap='coolwarm', aspect='auto', norm=norm, interpolation='nearest')
-    
+
     ax.set_xticks(np.arange(12))
     ax.set_yticks(np.arange(8))
-    ax.set_xticklabels([str(i+1) for i in range(12)], fontsize=13)
+    ax.set_xticklabels([str(i + 1) for i in range(12)], fontsize=13)
     ax.set_yticklabels(list('ABCDEFGH'), fontsize=13)
     ax.xaxis.tick_top()
     ax.xaxis.set_label_position('top')
-    
+
     cbar = plt.colorbar(im, ax=ax, pad=0.02, fraction=0.03, aspect=35)
     cbar.set_label('Fold Change', rotation=270, labelpad=25, fontsize=14)
     cbar.ax.tick_params(labelsize=11)
     cbar.outline.set_linewidth(0.5)
     cbar.outline.set_edgecolor('#CCCCCC')
-    
+
     for i in range(8):
         for j in range(12):
             label = labels_matrix[i, j]
@@ -283,85 +415,86 @@ def create_fold_change_heatmap(fc_matrix, labels_matrix):
                     text_color = 'white'
                 else:
                     text_color = '#333333'
-                
+
                 if label:
                     text_str = f"{label}\n{fc:.2f}"
                     fontsize = 10
                 else:
                     text_str = f"{fc:.2f}"
                     fontsize = 11
-                
-                ax.text(j, i, text_str, ha="center", va="center", 
-                       color=text_color, fontsize=fontsize, weight='500',
-                       linespacing=1.3)
-    
+
+                ax.text(j, i, text_str, ha="center", va="center",
+                        color=text_color, fontsize=fontsize, weight='500',
+                        linespacing=1.3)
+
     for i in range(9):
         ax.axhline(i - 0.5, color='#999999', linewidth=1.8, zorder=10)
     for j in range(13):
         ax.axvline(j - 0.5, color='#999999', linewidth=1.8, zorder=10)
-    
+
     ax.set_xlabel('Column', fontsize=15, weight='500', labelpad=12, color='#333333')
     ax.set_ylabel('Row', fontsize=15, weight='500', labelpad=12, color='#333333')
-    
+
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.spines['bottom'].set_color('#999999')
     ax.spines['left'].set_color('#999999')
     ax.spines['bottom'].set_linewidth(1.5)
     ax.spines['left'].set_linewidth(1.5)
-    
+
     from matplotlib.patches import Patch
     legend_elements = [
         Patch(facecolor='#6495ED', edgecolor='#4A7AC2', linewidth=1.5, label='Decreased activity (FC < 1)'),
         Patch(facecolor='#F5F5F5', edgecolor='#999999', linewidth=1.5, label='No change (FC ≈ 1)'),
         Patch(facecolor='#FF6B6B', edgecolor='#E85555', linewidth=1.5, label='Increased activity (FC > 1)')
     ]
-    
-    legend = ax.legend(handles=legend_elements, loc='upper center', 
-                      bbox_to_anchor=(0.5, -0.06), ncol=3, frameon=True,
-                      fontsize=12, edgecolor='#999999', fancybox=False,
-                      framealpha=1, borderpad=1.2, columnspacing=2)
+
+    legend = ax.legend(handles=legend_elements, loc='upper center',
+                       bbox_to_anchor=(0.5, -0.06), ncol=3, frameon=True,
+                       fontsize=12, edgecolor='#999999', fancybox=False,
+                       framealpha=1, borderpad=1.2, columnspacing=2)
     legend.get_frame().set_linewidth(1.5)
     legend.get_frame().set_facecolor('#FAFAFA')
-    
-    fig.text(0.5, 0.005, f'Data Range: {vmin:.2f} – {vmax:.2f}', 
-            ha='center', fontsize=11, color='#666666', weight='500')
-    
+
+    fig.text(0.5, 0.005, f'Data Range: {vmin:.2f} – {vmax:.2f}',
+             ha='center', fontsize=11, color='#666666', weight='500')
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.96])
-    
+
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     tmp.close()
     fig.savefig(tmp.name, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close(fig)
-    
+
     return tmp.name
+
 
 def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_pre, df_post, meta):
     from datetime import datetime
-    
+
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=landscape(A4),
                             leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
-    
+
     doc.title = f"{meta.get('experiment_name', 'GloSensor Experiment')} - Analysis Report"
     doc.author = meta.get('name_input', 'Researcher')
     doc.subject = "GloSensor Assay Analysis"
     doc.creator = "GloSensor Analysis Tool"
-    
+
     elements = []
-    
-    title_style = ParagraphStyle(name='Title', alignment=TA_CENTER, fontSize=24, 
+
+    title_style = ParagraphStyle(name='Title', alignment=TA_CENTER, fontSize=24,
                                  spaceAfter=20, leading=28, textColor=colors.HexColor("#2C3E50"))
-    header_style = ParagraphStyle(name='Header', alignment=TA_CENTER, fontSize=14, 
+    header_style = ParagraphStyle(name='Header', alignment=TA_CENTER, fontSize=14,
                                   spaceAfter=6, leading=18)
-    section_style = ParagraphStyle(name='Section', alignment=TA_CENTER, fontSize=16, 
+    section_style = ParagraphStyle(name='Section', alignment=TA_CENTER, fontSize=16,
                                    spaceAfter=8, leading=18, textColor=colors.HexColor("#34495E"))
     small_style = ParagraphStyle(name='Small', alignment=TA_CENTER, fontSize=10, spaceAfter=6)
 
     elements.append(Spacer(1, 30))
     elements.append(Paragraph("GLOSENSOR ASSAY ANALYSIS REPORT", title_style))
     elements.append(Spacer(1, 20))
-    
+
     current_date = datetime.now().strftime("%B %d, %Y")
     elements.append(Paragraph(f"<b>Date:</b> {current_date}", header_style))
     elements.append(Spacer(1, 10))
@@ -370,10 +503,10 @@ def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_p
     elements.append(Paragraph(f"<b>Investigator:</b> {meta.get('name_input', 'N/A')}", header_style))
     elements.append(Spacer(1, 30))
     elements.append(PageBreak())
-    
+
     elements.append(Paragraph("<b>METHODS</b>", section_style))
     elements.append(Spacer(1, 15))
-    
+
     methods_paragraph_style = ParagraphStyle(
         name='Methods',
         fontSize=11,
@@ -383,7 +516,7 @@ def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_p
         leftIndent=30,
         rightIndent=30
     )
-    
+
     cells_val = meta.get('cells_seeded', 'N/A')
     media_vol = meta.get('media_volume', '')
     hrs_trans = meta.get('hrs_to_transfection', 'N/A')
@@ -401,24 +534,24 @@ def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_p
     incubation_time = meta.get('incubation_time', 'N/A')
     serum_free_medium = meta.get('serum_free_medium', 'N/A')
     dna_reagent_incubation = meta.get('dna_reagent_incubation', 'N/A')
-    
+
     transfection_section = f"""
     <b>Experimental Timeline and Transfection Details:</b><br/>
     """
-    
+
     # Add assay method
     if assay_method:
         transfection_section += f"Assay Method: {assay_method}<br/>"
-    
+
     # Add transfection details
     if transfection_direction:
         transfection_section += f"Transfection Direction: {transfection_direction}<br/>"
-    
+
     if transfection_agent:
         transfection_section += f"Transfection Agent: {transfection_agent}<br/>"
-    
+
     transfection_section += "<br/>"
-    
+
     # Add vessel information if Transfer method
     if assay_method == "Transfer method" and vessel_type and vessel_type in VESSEL_PROTOCOLS:
         protocol = VESSEL_PROTOCOLS[vessel_type]
@@ -430,19 +563,19 @@ def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_p
     Dilution Medium: {protocol['dilution_medium']}<br/>
     <br/>
     """
-    
+
     # Cell seeding
     transfection_section += f"""
     <b>Cell Seeding:</b><br/>
     Number of cells seeded: {cells_val}<br/>
     """
-    
+
     # Timeline to transfection (if forward)
     if transfection_direction == "Forward transfection":
         transfection_section += f"Hours from seeding to transfection: {hrs_trans} hrs<br/>"
-    
+
     transfection_section += "<br/>"
-    
+
     # Transfection details
     transfection_section += f"""
     <b>Transfection Mix Preparation:</b><br/>
@@ -452,12 +585,12 @@ def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_p
     Serum-Free Medium: {serum_free_medium} μl<br/>
     DNA + Reagent Incubation Time: {dna_reagent_incubation} min<br/>
     """
-    
+
     if transfection_direction == "Forward transfection" and media_vol:
         transfection_section += f"Cell Culture Medium Volume: {media_vol}<br/>"
-    
+
     transfection_section += "<br/>"
-    
+
     # Method-specific timeline
     if assay_method == "Transfer method":
         transfection_section += f"""
@@ -471,21 +604,22 @@ def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_p
     <b>Post-Transfection Timeline:</b><br/>
     Hours after transfection to assay: {hrs_assay} hrs<br/>
     """
-    
+
     transfection_section += "<br/>"
-    
+
     elements.append(Paragraph(transfection_section, methods_paragraph_style))
     elements.append(Spacer(1, 10))
-    
+
     methods_content = meta.get('methods_text', '')
     if methods_content and methods_content.strip() != '':
-        elements.append(Paragraph("<b>Protocol:</b><br/>" + methods_content.replace('\n', '<br/>'), methods_paragraph_style))
+        elements.append(
+            Paragraph("<b>Protocol:</b><br/>" + methods_content.replace('\n', '<br/>'), methods_paragraph_style))
         elements.append(Spacer(1, 10))
-    
+
     notes_content = meta.get('notes_text', '')
     if notes_content and notes_content.strip() != '':
         elements.append(Paragraph("<b>Notes:</b><br/>" + notes_content.replace('\n', '<br/>'), methods_paragraph_style))
-    
+
     elements.append(Spacer(1, 20))
     elements.append(PageBreak())
 
@@ -497,16 +631,16 @@ def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_p
         except Exception:
             elements.append(Image(filepath, width=650, height=390))
         elements.append(PageBreak())
-        
+
         if title == "Fold Change Heatmap":
             replicate_df = meta.get('replicate_df')
             if replicate_df is not None and not replicate_df.empty:
                 elements.append(Paragraph("<b>REPLICATE ANALYSIS</b>", section_style))
                 elements.append(Spacer(1, 10))
-                
+
                 rep_header = [['Label', 'n', 'Wells', 'Mean FC', 'Std Dev', 'CV%', 'Individual FCs']]
                 rep_data = rep_header
-                
+
                 for _, row in replicate_df.iterrows():
                     rep_data.append([
                         str(row['Label']),
@@ -517,19 +651,19 @@ def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_p
                         f"{row['CV%']:.1f}",
                         str(row['Individual FCs'])
                     ])
-                
+
                 rep_table = Table(rep_data, colWidths=[80, 30, 120, 60, 60, 50, 150])
-                
+
                 table_style = [
-                    ("GRID", (0,0), (-1,-1), 0.5, colors.black),
-                    ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#34495E")),
-                    ("TEXTCOLOR", (0,0), (-1,0), colors.whitesmoke),
-                    ("FONTSIZE", (0,0), (-1,-1), 8),
-                    ("ALIGN", (0,0), (-1,-1), "CENTER"),
-                    ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-                    ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#34495E")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                 ]
-                
+
                 for idx, (_, row) in enumerate(replicate_df.iterrows(), start=1):
                     cv = row['CV%']
                     if cv > 20:
@@ -538,44 +672,44 @@ def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_p
                         color = colors.HexColor("#fff4cc")
                     else:
                         color = colors.HexColor("#ccffcc")
-                    table_style.append(("BACKGROUND", (0,idx), (-1,idx), color))
-                
+                    table_style.append(("BACKGROUND", (0, idx), (-1, idx), color))
+
                 rep_table.setStyle(TableStyle(table_style))
-                
+
                 elements.append(rep_table)
                 elements.append(Spacer(1, 10))
-                
+
                 legend_text = "Color coding: Green (CV < 10%, Good) | Yellow (CV 10-20%, Moderate) | Red (CV > 20%, High variability)"
                 elements.append(Paragraph(legend_text, small_style))
-                
+
                 excluded_wells = meta.get('excluded_wells', {})
                 total_excluded = sum(len(wells) for wells in excluded_wells.values())
                 if total_excluded > 0:
                     excluded_text = f"Note: {total_excluded} well(s) were excluded from replicate calculations (shown with strikethrough)"
                     elements.append(Spacer(1, 5))
                     elements.append(Paragraph(excluded_text, small_style))
-                
+
                 elements.append(Spacer(1, 20))
                 elements.append(PageBreak())
 
     elements.append(Paragraph("<b>Raw Data Summary (Pre vs Post by Well)</b>", section_style))
     elements.append(Spacer(1, 10))
-    
+
     wells = [col for col in df_pre.columns if col != 'Time (min)']
     time_points = [f"{t:.1f}" for t in df_pre['Time (min)']]
-    
+
     num_time_cols = len(time_points)
     well_col_width = 50
     time_col_width = 40
     table_width = well_col_width + (num_time_cols * time_col_width)
-    
+
     col_widths = [well_col_width] + [time_col_width] * num_time_cols
-    
+
     wells_per_page = 24
-    
+
     for well_idx in range(0, len(wells), wells_per_page):
-        well_subset = wells[well_idx:well_idx+wells_per_page]
-        
+        well_subset = wells[well_idx:well_idx + wells_per_page]
+
         pre_header = [['PRE'], ['Well'] + time_points]
         pre_data = pre_header
         for well in well_subset:
@@ -584,33 +718,33 @@ def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_p
             row_idx = ord(row_letter) - ord('A')
             col_idx = col_num - 1
             label = labels_matrix[row_idx, col_idx]
-            
+
             if label:
                 well_display = f"{well}: {label}"
             else:
                 well_display = well
-            
+
             row = [well_display]
             for time_idx in range(len(df_pre)):
                 row.append(f"{df_pre[well].iloc[time_idx]:.1f}")
             pre_data.append(row)
-        
+
         pre_table = Table(pre_data, colWidths=col_widths)
         pre_table.setStyle(TableStyle([
-            ("SPAN", (0,0), (-1,0)),
-            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#2C5F7E")),
-            ("TEXTCOLOR", (0,0), (-1,0), colors.whitesmoke),
-            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-            ("FONTSIZE", (0,0), (-1,0), 10),
-            ("ALIGN", (0,0), (-1,0), "CENTER"),
-            ("GRID", (0,1), (-1,-1), 0.5, colors.black),
-            ("BACKGROUND", (0,1), (-1,1), colors.HexColor("#4A7BA7")),
-            ("TEXTCOLOR", (0,1), (-1,1), colors.whitesmoke),
-            ("FONTSIZE", (0,1), (-1,-1), 7),
-            ("ALIGN", (0,1), (-1,-1), "CENTER"),
-            ("VALIGN", (0,1), (-1,-1), "MIDDLE"),
+            ("SPAN", (0, 0), (-1, 0)),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2C5F7E")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 10),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("GRID", (0, 1), (-1, -1), 0.5, colors.black),
+            ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#4A7BA7")),
+            ("TEXTCOLOR", (0, 1), (-1, 1), colors.whitesmoke),
+            ("FONTSIZE", (0, 1), (-1, -1), 7),
+            ("ALIGN", (0, 1), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 1), (-1, -1), "MIDDLE"),
         ]))
-        
+
         post_header = [['POST'], ['Well'] + time_points]
         post_data = post_header
         for well in well_subset:
@@ -619,44 +753,44 @@ def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_p
             row_idx = ord(row_letter) - ord('A')
             col_idx = col_num - 1
             label = labels_matrix[row_idx, col_idx]
-            
+
             if label:
                 well_display = f"{well}: {label}"
             else:
                 well_display = well
-            
+
             row = [well_display]
             for time_idx in range(len(df_post)):
                 row.append(f"{df_post[well].iloc[time_idx]:.1f}")
             post_data.append(row)
-        
+
         post_table = Table(post_data, colWidths=col_widths)
         post_table.setStyle(TableStyle([
-            ("SPAN", (0,0), (-1,0)),
-            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#7E2C2C")),
-            ("TEXTCOLOR", (0,0), (-1,0), colors.whitesmoke),
-            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-            ("FONTSIZE", (0,0), (-1,0), 10),
-            ("ALIGN", (0,0), (-1,0), "CENTER"),
-            ("GRID", (0,1), (-1,-1), 0.5, colors.black),
-            ("BACKGROUND", (0,1), (-1,1), colors.HexColor("#A74A4A")),
-            ("TEXTCOLOR", (0,1), (-1,1), colors.whitesmoke),
-            ("FONTSIZE", (0,1), (-1,-1), 7),
-            ("ALIGN", (0,1), (-1,-1), "CENTER"),
-            ("VALIGN", (0,1), (-1,-1), "MIDDLE"),
+            ("SPAN", (0, 0), (-1, 0)),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#7E2C2C")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 10),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("GRID", (0, 1), (-1, -1), 0.5, colors.black),
+            ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#A74A4A")),
+            ("TEXTCOLOR", (0, 1), (-1, 1), colors.whitesmoke),
+            ("FONTSIZE", (0, 1), (-1, -1), 7),
+            ("ALIGN", (0, 1), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 1), (-1, -1), "MIDDLE"),
         ]))
-        
+
         side_by_side = Table([[pre_table, post_table]], colWidths=[table_width, table_width])
         side_by_side.setStyle(TableStyle([
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("LEFTPADDING", (0,0), (-1,-1), 5),
-            ("RIGHTPADDING", (0,0), (-1,-1), 5),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
         ]))
-        
+
         elements.append(side_by_side)
         elements.append(Spacer(1, 20))
         elements.append(PageBreak())
-    
+
     try:
         doc.build(elements)
         return buffer.getvalue()
@@ -664,27 +798,28 @@ def generate_pdf_bytes(fig_files_info, labels_matrix, fc_values, export_df, df_p
         st.error(f"Error building PDF: {e}")
         return None
 
+
 def main():
     st.set_page_config(page_title="GloSensor Assay Analysis", layout="wide", initial_sidebar_state="expanded")
-    
+
     st.markdown("""
         <style>
         /* Import Google Fonts */
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-        
+
         /* Global Styles */
         html, body, [class*="css"] {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             scroll-behavior: smooth;
         }
-        
+
         /* Main Container Styling */
         .main .block-container {
             padding-top: 2rem;
             padding-bottom: 2rem;
             max-width: 1400px;
         }
-        
+
         /* Header Styling */
         .main-header {
             font-size: 3rem;
@@ -697,7 +832,7 @@ def main():
             padding: 1.5rem 0 0.5rem 0;
             letter-spacing: -0.02em;
         }
-        
+
         .sub-header {
             font-size: 1.1rem;
             color: #64748b;
@@ -705,18 +840,18 @@ def main():
             padding-bottom: 2rem;
             font-weight: 400;
         }
-        
+
         /* Sidebar Styling */
         [data-testid="stSidebar"] {
             background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
         }
-        
+
         [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
         [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h2 {
             color: #1e293b;
             font-weight: 600;
         }
-        
+
         /* Tab Styling */
         .stTabs [data-baseweb="tab-list"] {
             gap: 8px;
@@ -725,7 +860,7 @@ def main():
             border-radius: 16px;
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
         }
-        
+
         .stTabs [data-baseweb="tab"] {
             padding: 12px 24px;
             font-size: 0.95rem;
@@ -735,18 +870,18 @@ def main():
             color: #64748b;
             border: none;
         }
-        
+
         .stTabs [data-baseweb="tab"]:hover {
             background-color: #e2e8f0;
             color: #475569;
         }
-        
+
         .stTabs [aria-selected="true"] {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
             color: white !important;
             box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
         }
-        
+
         /* Button Styling */
         .stButton > button {
             border-radius: 12px;
@@ -759,21 +894,21 @@ def main():
             background: white;
             color: #475569;
         }
-        
+
         .stButton > button:hover {
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
             transform: translateY(-2px);
         }
-        
+
         .stButton > button[kind="primary"] {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
         }
-        
+
         .stButton > button[kind="primary"]:hover {
             box-shadow: 0 8px 20px rgba(102, 126, 234, 0.4);
         }
-        
+
         /* Download Button Special Styling */
         .stDownloadButton > button {
             background: linear-gradient(135deg, #10b981 0%, #059669 100%);
@@ -783,12 +918,12 @@ def main():
             padding: 0.6rem 1.5rem;
             box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3);
         }
-        
+
         .stDownloadButton > button:hover {
             box-shadow: 0 4px 16px rgba(16, 185, 129, 0.4);
             transform: translateY(-2px);
         }
-        
+
         /* Input Field Styling */
         .stTextInput > div > div > input,
         .stNumberInput > div > div > input,
@@ -800,7 +935,7 @@ def main():
             transition: all 0.3s ease;
             font-size: 0.95rem;
         }
-        
+
         .stTextInput > div > div > input:focus,
         .stNumberInput > div > div > input:focus,
         .stSelectbox > div > div > select:focus,
@@ -808,12 +943,12 @@ def main():
             border-color: #667eea;
             box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
         }
-        
+
         /* Selectbox Styling */
         .stSelectbox > div > div {
             border-radius: 10px;
         }
-        
+
         /* Metric Card Styling */
         [data-testid="stMetricValue"] {
             font-size: 2rem;
@@ -823,7 +958,7 @@ def main():
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
-        
+
         [data-testid="stMetricLabel"] {
             font-size: 0.85rem;
             font-weight: 600;
@@ -831,11 +966,11 @@ def main():
             text-transform: uppercase;
             letter-spacing: 0.05em;
         }
-        
+
         [data-testid="stMetricDelta"] {
             font-size: 0.9rem;
         }
-        
+
         /* DataFrame Styling */
         .dataframe {
             border-radius: 12px;
@@ -843,7 +978,7 @@ def main():
             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
             border: 1px solid #e2e8f0;
         }
-        
+
         .dataframe thead tr th {
             background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
             color: #475569;
@@ -851,11 +986,11 @@ def main():
             padding: 12px;
             font-size: 0.9rem;
         }
-        
+
         .dataframe tbody tr:hover {
             background-color: #f8fafc;
         }
-        
+
         /* Alert/Info Box Styling */
         .stAlert {
             border-radius: 12px;
@@ -863,27 +998,27 @@ def main():
             border: none;
             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
         }
-        
+
         .stSuccess {
             background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
             border-left: 4px solid #10b981;
         }
-        
+
         .stInfo {
             background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%);
             border-left: 4px solid #3b82f6;
         }
-        
+
         .stWarning {
             background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
             border-left: 4px solid #f59e0b;
         }
-        
+
         .stError {
             background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
             border-left: 4px solid #ef4444;
         }
-        
+
         /* Expander Styling */
         .streamlit-expanderHeader {
             border-radius: 10px;
@@ -891,11 +1026,11 @@ def main():
             font-weight: 500;
             color: #475569;
         }
-        
+
         .streamlit-expanderHeader:hover {
             background-color: #f1f5f9;
         }
-        
+
         /* File Uploader Styling */
         [data-testid="stFileUploader"] {
             border: 2px dashed #cbd5e1;
@@ -904,12 +1039,12 @@ def main():
             background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
             transition: all 0.3s ease;
         }
-        
+
         [data-testid="stFileUploader"]:hover {
             border-color: #667eea;
             background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%);
         }
-        
+
         /* Divider Styling */
         hr {
             margin: 2rem 0;
@@ -917,81 +1052,81 @@ def main():
             height: 1px;
             background: linear-gradient(90deg, transparent, #e2e8f0, transparent);
         }
-        
+
         /* Card/Container Styling */
         .element-container {
             transition: all 0.3s ease;
         }
-        
+
         /* Checkbox Styling */
         .stCheckbox {
             padding: 0.5rem 0;
         }
-        
+
         /* Radio Button Styling */
         .stRadio > label {
             font-weight: 500;
             color: #475569;
         }
-        
+
         /* Spinner Styling */
         .stSpinner > div {
             border-color: #667eea transparent #667eea transparent;
         }
-        
+
         /* Remove link underlines */
         a {
             text-decoration: none !important;
             color: #667eea;
             font-weight: 500;
         }
-        
+
         a:hover {
             color: #764ba2;
         }
-        
+
         /* Section Headers */
         h1, h2, h3, h4, h5, h6 {
             color: #1e293b;
             font-weight: 600;
         }
-        
+
         /* Improve overall spacing */
         .block-container > div {
             padding-top: 1rem;
         }
         </style>
     """, unsafe_allow_html=True)
-    
+
     if 'data_loaded' not in st.session_state:
         st.session_state.data_loaded = False
     if 'excluded_wells' not in st.session_state:
         st.session_state.excluded_wells = {}
-    
+
     # Process uploaded Excel file if present
     if 'uploaded_file' in st.session_state and st.session_state.uploaded_file is not None and not st.session_state.data_loaded:
         try:
             uploaded_file = st.session_state.uploaded_file
             xls = pd.ExcelFile(uploaded_file)
-            
+
             if 'Pre' not in xls.sheet_names or 'Post' not in xls.sheet_names:
                 st.error("Excel file must contain 'Pre' and 'Post' sheets")
                 st.session_state.uploaded_file = None
                 st.stop()
-            
+
             df_pre, avg_pre = process_sheet(xls, 'Pre')
             df_post, avg_post = process_sheet(xls, 'Post')
-            
+
             if df_pre is None or df_post is None:
                 st.error("Failed to process data sheets")
                 st.session_state.uploaded_file = None
                 st.stop()
-            
+
             fold_change = (avg_post / avg_pre).round(2)
-            
+
             labels_matrix = np.empty((8, 12), dtype=object)
             labels_matrix[:] = ""
-            
+
             if 'Labels' in xls.sheet_names:
                 try:
                     df_labels = pd.read_excel(xls, sheet_name='Labels', index_col=0)
@@ -1005,14 +1140,14 @@ def main():
                                         labels_matrix[row_idx, col_idx] = str(label)
                 except Exception as e:
                     st.warning(f"Could not load labels: {e}")
-            
+
             export_data = []
             fc_matrix = np.empty((8, 12))
             fc_matrix[:] = np.nan
-            
+
             for row_idx, row_letter in enumerate("ABCDEFGH"):
                 for col_idx in range(12):
-                    well_name = f"{row_letter}{col_idx+1}"
+                    well_name = f"{row_letter}{col_idx + 1}"
                     if well_name in avg_pre.index:
                         label = labels_matrix[row_idx, col_idx]
                         pre_val = avg_pre[well_name]
@@ -1026,9 +1161,9 @@ def main():
                             'Post Avg': post_val,
                             'Fold Change': fc_val
                         })
-            
+
             export_df = pd.DataFrame(export_data)
-            
+
             st.session_state.update({
                 'export_df': export_df,
                 'df_pre': df_pre,
@@ -1038,14 +1173,14 @@ def main():
                 'data_loaded': True
             })
             st.rerun()
-            
+
         except Exception as e:
             st.error(f"Error processing file: {e}")
             st.session_state.uploaded_file = None
             import traceback
             st.code(traceback.format_exc())
             st.stop()
-    
+
     # Show welcome page if no data is loaded
     if not st.session_state.data_loaded:
         # WELCOME PAGE
@@ -1062,10 +1197,10 @@ def main():
                 </p>
             </div>
         """, unsafe_allow_html=True)
-        
+
         # Main content area
         col_spacer1, col_main, col_spacer2 = st.columns([1, 2.5, 1])
-        
+
         with col_main:
             # Upload Excel Section
             st.markdown("""
@@ -1080,7 +1215,7 @@ def main():
                     </p>
                 </div>
             """, unsafe_allow_html=True)
-            
+
             # File uploader
             uploaded_file = st.file_uploader(
                 "Choose an Excel file (.xlsx or .xls)",
@@ -1088,11 +1223,11 @@ def main():
                 help="Your Excel file must contain three sheets: 'Pre', 'Post', and 'Labels'",
                 key="welcome_excel_upload"
             )
-            
+
             if uploaded_file:
                 st.session_state.uploaded_file = uploaded_file
                 st.rerun()
-            
+
             # Template download section
             st.markdown("""
                 <div style="background: #fef9e7; 
@@ -1106,35 +1241,35 @@ def main():
                     </p>
                 </div>
             """, unsafe_allow_html=True)
-            
+
             # Create and provide template download
             template_buffer = BytesIO()
-            
+
             # Create template data
             labels_data = {}
             for col_num in range(1, 13):
                 labels_data[str(col_num)] = [''] * 8
             labels_template = pd.DataFrame(labels_data, index=list('ABCDEFGH'))
-            
+
             time_points = [0, 5, 10, 15, 20, 25, 30]
             wells = []
             for row in "ABCDEFGH":
                 for col in range(1, 13):
                     wells.append(f"{row}{col}")
-            
+
             pre_template = pd.DataFrame({'Time (min)': time_points})
             for well in wells:
                 pre_template[well] = 0.0
-            
+
             post_template = pd.DataFrame({'Time (min)': time_points})
             for well in wells:
                 post_template[well] = 0.0
-            
+
             with pd.ExcelWriter(template_buffer, engine='openpyxl') as writer:
                 labels_template.to_excel(writer, sheet_name='Labels', index=True)
                 pre_template.to_excel(writer, sheet_name='Pre', index=False)
                 post_template.to_excel(writer, sheet_name='Post', index=False)
-            
+
             st.download_button(
                 label="Download Excel Template",
                 data=template_buffer.getvalue(),
@@ -1142,7 +1277,7 @@ def main():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
-            
+
             # Divider
             st.markdown("""
                 <div style="text-align: center; margin: 2rem 0 1.5rem 0;">
@@ -1151,7 +1286,7 @@ def main():
                                  color: #94a3b8; font-size: 0.8rem; font-weight: 500;">OR</span>
                 </div>
             """, unsafe_allow_html=True)
-            
+
             # Load saved analysis section
             st.markdown("""
                 <div style="background: white; 
@@ -1165,14 +1300,14 @@ def main():
                     </p>
                 </div>
             """, unsafe_allow_html=True)
-            
+
             analysis_file = st.file_uploader(
                 "Upload Saved Analysis (.gsa)",
                 type=['gsa'],
                 help="Load a previously saved analysis session",
                 key="welcome_gsa_upload"
             )
-            
+
             if analysis_file:
                 with st.spinner("Loading analysis..."):
                     state = load_analysis_state(analysis_file)
@@ -1189,10 +1324,10 @@ def main():
                         })
                         st.success("Analysis loaded successfully")
                         st.rerun()
-        
+
         # Don't show the rest of the app
         return
-    
+
     # SIDEBAR - Only shown when data is loaded
     with st.sidebar:
         st.markdown("""
@@ -1201,39 +1336,40 @@ def main():
                 <h2 style="color: white; margin: 0; font-size: 1.2rem; font-weight: 600;">GloSensor Analysis</h2>
             </div>
         """, unsafe_allow_html=True)
-        
+
         st.markdown("### Experiment Info")
-        experiment_name = st.text_input("Experiment Name*", 
-                                       value=st.session_state.get('experiment_name', 'My Experiment'),
-                                       help="Give your experiment a unique name")
-        name_input = st.text_input("Investigator*", 
+        experiment_name = st.text_input("Experiment Name*",
+                                        value=st.session_state.get('experiment_name', 'My Experiment'),
+                                        help="Give your experiment a unique name")
+        name_input = st.text_input("Investigator*",
                                    value=st.session_state.get('name_input', 'Researcher'),
                                    help="Your name or lab member name")
-        
+
         st.session_state.experiment_name = experiment_name
         st.session_state.name_input = name_input
-        
+
         st.markdown("---")
         st.markdown("### Start Over")
         if st.button("Return to Welcome", use_container_width=True):
             st.session_state.data_loaded = False
             st.session_state.clear()
             st.rerun()
-    
+
     if st.session_state.data_loaded:
         export_df = st.session_state.export_df
         df_pre = st.session_state.df_pre
         df_post = st.session_state.df_post
         labels_matrix = st.session_state.labels_matrix
         fc_matrix = st.session_state.fc_matrix
-    
+
     # Show analysis tabs when data is loaded
     if not st.session_state.data_loaded:
         # This shouldn't happen as we return from welcome page, but just in case
         return
-    
-    tab1, tab2, tab3, tab4 = st.tabs(["Experimental Setup", "Well Labels", "Analysis Results", "Export"])
-    
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["Experimental Setup", "Well Labels", "Analysis Results", "EC50 Calculation", "Export"])
+
     with tab1:
         st.markdown("""
             <div style="text-align: center; padding: 2rem 0 1.5rem 0;">
@@ -1246,7 +1382,7 @@ def main():
                 </p>
             </div>
         """, unsafe_allow_html=True)
-        
+
         # Step 1: Assay Method Selection (Always visible)
         st.markdown("""
             <div style="background: linear-gradient(135deg, #f0f9ff 0%, #f5f3ff 100%); 
@@ -1260,7 +1396,7 @@ def main():
                 </p>
             </div>
         """, unsafe_allow_html=True)
-        
+
         col_method1, col_method2 = st.columns([1, 2])
         with col_method1:
             assay_method = st.radio(
@@ -1271,20 +1407,22 @@ def main():
                 help="Direct: cells seeded directly into assay plate. Transfer: cells grown in larger vessel then transferred"
             )
             st.session_state.assay_method = assay_method
-        
+
         with col_method2:
             if assay_method == "Direct method":
-                st.info("📌 **Direct Method:** Cells are seeded directly into 96-well assay plates and transfected in place")
+                st.info(
+                    "📌 **Direct Method:** Cells are seeded directly into 96-well assay plates and transfected in place")
                 vessel_type = '96-well'
                 st.session_state.vessel_type = vessel_type
             else:
-                st.info("📌 **Transfer Method:** Cells are grown in a larger culture vessel, transfected, then transferred to 96-well assay plates")
-        
+                st.info(
+                    "📌 **Transfer Method:** Cells are grown in a larger culture vessel, transfected, then transferred to 96-well assay plates")
+
         # Only show rest of form if assay method is selected
         if not assay_method:
             st.info("👆 Please select an assay method to continue")
             return
-        
+
         # Step 2: Transfection Direction (Appears after assay method selected)
         st.markdown("""
             <div style="background: linear-gradient(135deg, #f0f9ff 0%, #f5f3ff 100%); 
@@ -1298,33 +1436,35 @@ def main():
                 </p>
             </div>
         """, unsafe_allow_html=True)
-        
+
         col_dir1, col_dir2 = st.columns([1, 2])
         with col_dir1:
             transfection_direction = st.radio(
                 "Select Direction*",
                 ["Forward transfection", "Reverse transfection"],
-                index=0 if st.session_state.get('transfection_direction', 'Forward transfection') == 'Forward transfection' else 1,
+                index=0 if st.session_state.get('transfection_direction',
+                                                'Forward transfection') == 'Forward transfection' else 1,
                 key="transfection_direction_radio",
                 help="Forward: cells seeded first, then transfected. Reverse: seeded and transfected simultaneously"
             )
             st.session_state.transfection_direction = transfection_direction
-        
+
         with col_dir2:
             if transfection_direction == "Forward transfection":
                 st.info("📌 **Forward Transfection:** Seed cells → Wait for attachment → Transfect")
             else:
-                st.success("📌 **Reverse Transfection:** Seeding and transfection occur simultaneously (0 hrs wait time)")
+                st.success(
+                    "📌 **Reverse Transfection:** Seeding and transfection occur simultaneously (0 hrs wait time)")
                 st.session_state.hrs_to_transfection = "0 (simultaneous)"
-        
+
         # Only show rest of form if transfection direction is selected
         if not transfection_direction:
             st.info("👆 Please select a transfection direction to continue")
             return
-        
+
         # Now show the rest of the form based on selections
         st.markdown("---")
-        
+
         # Cell Seeding
         st.markdown("""
             <div style="background: linear-gradient(135deg, #f0f9ff 0%, #f5f3ff 100%); 
@@ -1338,9 +1478,9 @@ def main():
                 </p>
             </div>
         """, unsafe_allow_html=True)
-        
+
         col_seed1, col_seed2, col_seed3 = st.columns(3)
-        
+
         with col_seed1:
             if assay_method == "Transfer method":
                 vessel_options = list(VESSEL_PROTOCOLS.keys())
@@ -1356,12 +1496,12 @@ def main():
             else:
                 st.markdown("**Vessel Type**")
                 st.markdown("🧪 96-well plate")
-        
+
         default_cells = {
             '96-well': 50000, '24-well': 100000, '12-well': 200000,
             '6-well': 400000, '60-mm': 1000000, '10-cm': 2000000
         }
-        
+
         with col_seed2:
             current_cells = st.session_state.get('cells_seeded', '')
             if current_cells and current_cells != '':
@@ -1371,14 +1511,14 @@ def main():
                     current_cells_val = default_cells.get(vessel_type, 50000)
             else:
                 current_cells_val = default_cells.get(vessel_type, 50000)
-            
+
             if assay_method == "Transfer method":
                 label_text = "Cells Seeded*"
                 help_text = f"Total cells seeded in {vessel_type}"
             else:
                 label_text = "Cells Seeded (per well)*"
                 help_text = "Cells seeded per well of 96-well plate"
-            
+
             cells_seeded = st.number_input(
                 label_text,
                 min_value=1000, max_value=10000000, value=current_cells_val, step=1000,
@@ -1386,7 +1526,7 @@ def main():
                 key="cells_seeded_number", format="%d"
             )
             st.session_state.cells_seeded = f"{cells_seeded:,}"
-        
+
         with col_seed3:
             vessel_info = VESSEL_PROTOCOLS[vessel_type]
             default_media = vessel_info['plating_medium']
@@ -1397,7 +1537,7 @@ def main():
                 key="media_volume_input"
             )
             st.session_state.media_volume = media_volume
-        
+
         # Cell Attachment Period (only for Forward)
         if transfection_direction == "Forward transfection":
             st.markdown("""
@@ -1412,7 +1552,7 @@ def main():
                     </p>
                 </div>
             """, unsafe_allow_html=True)
-            
+
             current_hrs = st.session_state.get('hrs_to_transfection', '')
             if current_hrs and current_hrs != '':
                 try:
@@ -1421,7 +1561,7 @@ def main():
                     current_hrs_val = 24
             else:
                 current_hrs_val = 24
-            
+
             hrs_to_transfection = st.number_input(
                 "Hours from Seeding to Transfection*",
                 min_value=0, max_value=168, value=current_hrs_val, step=1,
@@ -1429,7 +1569,7 @@ def main():
                 key="hrs_to_transfection_number"
             )
             st.session_state.hrs_to_transfection = str(hrs_to_transfection)
-        
+
         # Transfection Configuration
         st.markdown("""
             <div style="background: linear-gradient(135deg, #f0f9ff 0%, #f5f3ff 100%); 
@@ -1443,13 +1583,13 @@ def main():
                 </p>
             </div>
         """, unsafe_allow_html=True)
-        
+
         # Transfection Agent
         transfection_options = ["Lipofectamine 2000", "Polyethylenimine (PEI)", "Other"]
         current_agent = st.session_state.get('transfection_agent', 'Lipofectamine 2000')
         if current_agent not in transfection_options:
             current_agent = "Other"
-        
+
         col_agent1, col_agent2 = st.columns(2)
         with col_agent1:
             transfection_agent = st.selectbox(
@@ -1458,7 +1598,7 @@ def main():
                 index=transfection_options.index(current_agent),
                 key="transfection_agent_select"
             )
-        
+
         with col_agent2:
             if transfection_agent == "Other":
                 transfection_agent_custom = st.text_input(
@@ -1469,10 +1609,12 @@ def main():
                 st.session_state.transfection_agent = transfection_agent_custom if transfection_agent_custom else "Other"
             else:
                 st.session_state.transfection_agent = transfection_agent
-        
+
         # DNA and Reagent Amounts
-        st.markdown('<p style="color: #1e293b; font-size: 0.9rem; font-weight: 600; margin: 1rem 0 0.5rem 0;">🧬 DNA & Transfection Reagent</p>', unsafe_allow_html=True)
-        
+        st.markdown(
+            '<p style="color: #1e293b; font-size: 0.9rem; font-weight: 600; margin: 1rem 0 0.5rem 0;">🧬 DNA & Transfection Reagent</p>',
+            unsafe_allow_html=True)
+
         vessel_info = VESSEL_PROTOCOLS[vessel_type]
         dna_amount_from_vessel = vessel_info['dna_amount'].replace(' μg', '').replace('μg', '')
         try:
@@ -1480,9 +1622,9 @@ def main():
             default_biosensor = int(base_dna_ug * 1000 * 0.5)
         except:
             default_biosensor = 100
-        
+
         col_dna1, col_dna2, col_dna3 = st.columns(3)
-        
+
         with col_dna1:
             current_biosensor = st.session_state.get('biosensor_amount', '')
             if current_biosensor and current_biosensor != '':
@@ -1492,10 +1634,10 @@ def main():
                     current_biosensor_val = default_biosensor
             else:
                 current_biosensor_val = default_biosensor
-            
+
             amount_label = "Biosensor DNA (ng)*"
             amount_help = f"Amount per well" if assay_method == "Direct method" else f"Total amount for {vessel_type}"
-            
+
             biosensor_amount = st.number_input(
                 amount_label,
                 min_value=1, max_value=100000, value=current_biosensor_val, step=10,
@@ -1503,7 +1645,7 @@ def main():
                 key="biosensor_amount_number"
             )
             st.session_state.biosensor_amount = str(biosensor_amount)
-        
+
         with col_dna2:
             current_gpcr = st.session_state.get('gpcr_amount', '')
             if current_gpcr and current_gpcr != '':
@@ -1513,7 +1655,7 @@ def main():
                     current_gpcr_val = default_biosensor
             else:
                 current_gpcr_val = default_biosensor
-            
+
             gpcr_amount = st.number_input(
                 "GPCR DNA (ng)*",
                 min_value=1, max_value=100000, value=current_gpcr_val, step=10,
@@ -1521,13 +1663,13 @@ def main():
                 key="gpcr_amount_number"
             )
             st.session_state.gpcr_amount = str(gpcr_amount)
-        
+
         with col_dna3:
             ratio_options = ["1:1", "1:2", "1:3", "1:4", "1:5", "1:6"]
             current_ratio = st.session_state.get('agent_amount_ratio', '1:3')
             if current_ratio not in ratio_options:
                 current_ratio = '1:3'
-            
+
             agent_amount_ratio = st.selectbox(
                 "DNA to Transfection Reagent Ratio*",
                 options=ratio_options,
@@ -1536,12 +1678,14 @@ def main():
                 key="agent_amount_ratio_input"
             )
             st.session_state.agent_amount_ratio = agent_amount_ratio
-        
+
         # Transfection Mix Preparation
-        st.markdown('<p style="color: #1e293b; font-size: 0.9rem; font-weight: 600; margin: 1rem 0 0.5rem 0;">⚗️ Transfection Mix Preparation</p>', unsafe_allow_html=True)
-        
+        st.markdown(
+            '<p style="color: #1e293b; font-size: 0.9rem; font-weight: 600; margin: 1rem 0 0.5rem 0;">⚗️ Transfection Mix Preparation</p>',
+            unsafe_allow_html=True)
+
         col_prep1, col_prep2 = st.columns(2)
-        
+
         with col_prep1:
             serum_free_medium = st.text_input(
                 "Serum-Free Medium (μl)*",
@@ -1551,7 +1695,7 @@ def main():
                 placeholder="e.g., 25"
             )
             st.session_state.serum_free_medium = serum_free_medium
-        
+
         with col_prep2:
             current_incubation = st.session_state.get('dna_reagent_incubation', '')
             if current_incubation and current_incubation != '':
@@ -1561,7 +1705,7 @@ def main():
                     current_incubation_val = 20
             else:
                 current_incubation_val = 20
-            
+
             dna_reagent_incubation = st.number_input(
                 "DNA + Reagent Incubation (min)*",
                 min_value=0, max_value=60, value=current_incubation_val, step=1,
@@ -1569,7 +1713,7 @@ def main():
                 key="dna_reagent_incubation_number"
             )
             st.session_state.dna_reagent_incubation = str(dna_reagent_incubation)
-        
+
         # Post-Transfection Timeline
         st.markdown("""
             <div style="background: linear-gradient(135deg, #f0f9ff 0%, #f5f3ff 100%); 
@@ -1583,10 +1727,10 @@ def main():
                 </p>
             </div>
         """, unsafe_allow_html=True)
-        
+
         if assay_method == "Transfer method":
             col_time1, col_time2 = st.columns(2)
-            
+
             with col_time1:
                 current_transfer = st.session_state.get('hrs_to_transfer', '')
                 if current_transfer and current_transfer != '':
@@ -1596,7 +1740,7 @@ def main():
                         current_transfer_val = 24
                 else:
                     current_transfer_val = 24
-                
+
                 hrs_to_transfer = st.number_input(
                     "Transfection → Transfer to 96-well (hrs)*",
                     min_value=0, max_value=168, value=current_transfer_val, step=1,
@@ -1604,7 +1748,7 @@ def main():
                     key="hrs_to_transfer_number"
                 )
                 st.session_state.hrs_to_transfer = str(hrs_to_transfer)
-            
+
             with col_time2:
                 current_incubation = st.session_state.get('incubation_time', '')
                 if current_incubation and current_incubation != '':
@@ -1614,7 +1758,7 @@ def main():
                         current_incubation_val = 24
                 else:
                     current_incubation_val = 24
-                
+
                 incubation_time = st.number_input(
                     "Transfer → Assay (hrs)*",
                     min_value=0, max_value=168, value=current_incubation_val, step=1,
@@ -1622,10 +1766,12 @@ def main():
                     key="incubation_time_number"
                 )
                 st.session_state.incubation_time = str(incubation_time)
-            
+
             # Cells transferred - this is the LAST step before assay
-            st.markdown('<p style="color: #1e293b; font-size: 0.9rem; font-weight: 600; margin: 1rem 0 0.5rem 0;">📋 Transfer to Assay Plate</p>', unsafe_allow_html=True)
-            
+            st.markdown(
+                '<p style="color: #1e293b; font-size: 0.9rem; font-weight: 600; margin: 1rem 0 0.5rem 0;">📋 Transfer to Assay Plate</p>',
+                unsafe_allow_html=True)
+
             default_transfer = {
                 '96-well': 20000, '24-well': 40000, '12-well': 80000,
                 '6-well': 200000, '60-mm': 500000, '10-cm': 1000000
@@ -1638,7 +1784,7 @@ def main():
                     current_transferred_val = default_transfer.get(vessel_type, 20000)
             else:
                 current_transferred_val = default_transfer.get(vessel_type, 20000)
-            
+
             cells_transferred = st.number_input(
                 "Cells Transferred per Well of 96-well Plate*",
                 min_value=1000, max_value=10000000, value=current_transferred_val, step=1000,
@@ -1656,7 +1802,7 @@ def main():
                     current_assay_val = 48
             else:
                 current_assay_val = 48
-            
+
             hrs_to_assay = st.number_input(
                 "Transfection → Assay (hrs)*",
                 min_value=0, max_value=168, value=current_assay_val, step=1,
@@ -1668,7 +1814,7 @@ def main():
             st.session_state.hrs_to_transfer = ''
             st.session_state.cells_transferred = ''
             st.session_state.incubation_time = ''
-        
+
         # Protocol Documentation
         st.markdown("""
             <div style="background: linear-gradient(135deg, #f0f9ff 0%, #f5f3ff 100%); 
@@ -1682,9 +1828,9 @@ def main():
                 </p>
             </div>
         """, unsafe_allow_html=True)
-        
+
         col_doc1, col_doc2 = st.columns(2)
-        
+
         with col_doc1:
             methods_text = st.text_area(
                 "📝 Detailed Methods",
@@ -1695,7 +1841,7 @@ def main():
                 placeholder="Enter step-by-step protocol details..."
             )
             st.session_state.methods_text = methods_text
-        
+
         with col_doc2:
             notes_text = st.text_area(
                 "📌 Additional Notes",
@@ -1706,25 +1852,25 @@ def main():
                 placeholder="Enter any additional observations or notes..."
             )
             st.session_state.notes_text = notes_text
-        
+
     with tab2:
         st.header("🏷️ Well Labels Configuration")
         st.markdown("**Tip:** Wells with the same label will be treated as replicates in the analysis")
         st.markdown("---")
-        
+
         cols = st.columns(13)
         cols[0].write("")
         for col_idx in range(12):
             with cols[col_idx + 1]:
-                st.markdown(f"**{col_idx+1}**")
-        
+                st.markdown(f"**{col_idx + 1}**")
+
         for row_idx, row_letter in enumerate("ABCDEFGH"):
             cols = st.columns(13)
             with cols[0]:
                 st.markdown(f"**{row_letter}**")
-            
+
             for col_idx in range(12):
-                well_name = f"{row_letter}{col_idx+1}"
+                well_name = f"{row_letter}{col_idx + 1}"
                 default_label = labels_matrix[row_idx, col_idx]
                 with cols[col_idx + 1]:
                     label = st.text_input(
@@ -1734,13 +1880,13 @@ def main():
                         label_visibility="collapsed"
                     )
                     labels_matrix[row_idx, col_idx] = label if label else ""
-        
+
         st.session_state.labels_matrix = labels_matrix
-    
+
     export_data = []
     for row_idx, row_letter in enumerate("ABCDEFGH"):
         for col_idx in range(12):
-            well_name = f"{row_letter}{col_idx+1}"
+            well_name = f"{row_letter}{col_idx + 1}"
             well_data = export_df[export_df['Well'] == well_name]
             if not well_data.empty:
                 label = labels_matrix[row_idx, col_idx]
@@ -1751,12 +1897,12 @@ def main():
                     'Post Avg': well_data['Post Avg'].values[0],
                     'Fold Change': well_data['Fold Change'].values[0]
                 })
-    
+
     export_df = pd.DataFrame(export_data)
     st.session_state.export_df = export_df
-    
+
     replicate_df = analyze_replicates(export_df, st.session_state.excluded_wells)
-    
+
     with tab3:
         st.markdown("""
             <div style="text-align: center; padding: 2rem 0 1.5rem 0;">
@@ -1769,12 +1915,12 @@ def main():
                 </p>
             </div>
         """, unsafe_allow_html=True)
-        
+
         # Calculate exclusion stats
         total_excluded = sum(len(wells) for wells in st.session_state.excluded_wells.values())
-        
+
         col1, col2, col3, col4 = st.columns(4)
-        
+
         with col1:
             total_wells = len(export_df)
             st.markdown(f"""
@@ -1793,10 +1939,10 @@ def main():
                     </div>
                 </div>
             """, unsafe_allow_html=True)
-        
+
         with col2:
             active_wells = len(export_df[export_df['Fold Change'] > 2.0])
-            percentage = f"{active_wells/len(export_df)*100:.1f}%" if len(export_df) > 0 else "0%"
+            percentage = f"{active_wells / len(export_df) * 100:.1f}%" if len(export_df) > 0 else "0%"
             st.markdown(f"""
                 <div style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); 
                             padding: 0.75rem 1rem; border-radius: 10px; 
@@ -1813,7 +1959,7 @@ def main():
                     </div>
                 </div>
             """, unsafe_allow_html=True)
-        
+
         with col3:
             replicate_count = len(replicate_df) if replicate_df is not None else 0
             st.markdown(f"""
@@ -1832,7 +1978,7 @@ def main():
                     </div>
                 </div>
             """, unsafe_allow_html=True)
-        
+
         with col4:
             st.markdown(f"""
                 <div style="background: linear-gradient(135deg, #fa709a 0%, #fee140 100%); 
@@ -1850,29 +1996,31 @@ def main():
                     </div>
                 </div>
             """, unsafe_allow_html=True)
-        
+
         st.markdown("<br>", unsafe_allow_html=True)
-        
+
         if replicate_df is not None:
             grouped = export_df[export_df['Label'].str.strip() != ''].groupby('Label')
             replicate_groups = {label: group for label, group in grouped if len(group) > 1}
-            
+
             if replicate_groups:
-                st.markdown('<h4 style="color: #1e293b; font-size: 1.05rem; font-weight: 600; margin-bottom: 0.5rem;">🧬 Replicate Groups</h4><p style="color: #64748b; font-size: 0.85rem; margin-bottom: 1rem;">Click on any group card to expand and manage wells</p>', unsafe_allow_html=True)
-                
+                st.markdown(
+                    '<h4 style="color: #1e293b; font-size: 1.05rem; font-weight: 600; margin-bottom: 0.5rem;">🧬 Replicate Groups</h4><p style="color: #64748b; font-size: 0.85rem; margin-bottom: 1rem;">Click on any group card to expand and manage wells</p>',
+                    unsafe_allow_html=True)
+
                 # Initialize expanded_groups as empty set to start all collapsed
                 if 'expanded_groups' not in st.session_state:
                     st.session_state.expanded_groups = set()
-                
+
                 for label in sorted(replicate_groups.keys()):
                     group = replicate_groups[label]
-                    
+
                     if label not in st.session_state.excluded_wells:
                         st.session_state.excluded_wells[label] = []
-                    
+
                     excluded_for_label = st.session_state.excluded_wells[label]
                     included_wells = group[~group['Well'].isin(excluded_for_label)]
-                    
+
                     if len(included_wells) > 1:
                         mean_fc = included_wells['Fold Change'].mean()
                         std_fc = included_wells['Fold Change'].std()
@@ -1885,7 +2033,7 @@ def main():
                         mean_fc = 0
                         std_fc = 0
                         cv_percent = 0
-                    
+
                     if cv_percent > 20:
                         cv_color = "#F8B4B4"
                         cv_border = "#FECACA"
@@ -1904,15 +2052,15 @@ def main():
                         cv_icon = "●"
                         cv_status = "Excellent"
                         status_bg = "#F0FDF4"
-                    
+
                     n_included = len(included_wells)
                     n_total = len(group)
                     mean_fc_display = f"{mean_fc:.3f}" if n_included > 0 else "—"
                     cv_display = f"{cv_percent:.1f}%"
-                    
+
                     is_expanded = label in st.session_state.expanded_groups
                     expand_icon = "▼" if is_expanded else "▶"
-                    
+
                     # Display the beautiful card HTML
                     st.markdown(f'''
                         <div style="background: linear-gradient(135deg, {status_bg} 0%, white 100%); 
@@ -1944,16 +2092,17 @@ def main():
                             </div>
                         </div>
                     ''', unsafe_allow_html=True)
-                    
+
                     # Create overlay button - positioned over the card
                     unique_key = f"btn_{label.replace(' ', '_').replace('.', '_')}"
-                    if st.button(".", key=unique_key, use_container_width=True, help=f"Click to expand/collapse {label}"):
+                    if st.button(".", key=unique_key, use_container_width=True,
+                                 help=f"Click to expand/collapse {label}"):
                         if label in st.session_state.expanded_groups:
                             st.session_state.expanded_groups.remove(label)
                         else:
                             st.session_state.expanded_groups.add(label)
                         st.rerun()
-                    
+
                     # Style the button to be transparent overlay
                     st.markdown(f'''
                         <style>
@@ -1973,32 +2122,44 @@ def main():
                         }}
                         </style>
                     ''', unsafe_allow_html=True)
-                    
+
                     # Show details if expanded
                     if is_expanded:
-                        st.markdown(f'<div style="background-color: white; padding: 1rem; border-radius: 8px; margin-bottom: 0.75rem; border-left: 4px solid {cv_border}; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">', unsafe_allow_html=True)
-                        
+                        st.markdown(
+                            f'<div style="background-color: white; padding: 1rem; border-radius: 8px; margin-bottom: 0.75rem; border-left: 4px solid {cv_border}; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">',
+                            unsafe_allow_html=True)
+
                         col1, col2, col3, col4 = st.columns(4)
                         std_fc_display = f"{std_fc:.3f}" if n_included > 1 else "—"
-                        
+
                         with col1:
-                            st.markdown(f'<div style="background-color: #F8FBFE; padding: 0.5rem; border-radius: 8px; text-align: center;"><div style="color: #64748b; font-size: 0.7rem; font-weight: 500; text-transform: uppercase; margin-bottom: 0.2rem;">Mean FC</div><div style="color: #1e293b; font-size: 1.3rem; font-weight: 600;">{mean_fc_display}</div></div>', unsafe_allow_html=True)
+                            st.markdown(
+                                f'<div style="background-color: #F8FBFE; padding: 0.5rem; border-radius: 8px; text-align: center;"><div style="color: #64748b; font-size: 0.7rem; font-weight: 500; text-transform: uppercase; margin-bottom: 0.2rem;">Mean FC</div><div style="color: #1e293b; font-size: 1.3rem; font-weight: 600;">{mean_fc_display}</div></div>',
+                                unsafe_allow_html=True)
                         with col2:
-                            st.markdown(f'<div style="background-color: #F8FBFE; padding: 0.5rem; border-radius: 8px; text-align: center;"><div style="color: #64748b; font-size: 0.7rem; font-weight: 500; text-transform: uppercase; margin-bottom: 0.2rem;">Std Dev</div><div style="color: #1e293b; font-size: 1.3rem; font-weight: 600;">{std_fc_display}</div></div>', unsafe_allow_html=True)
+                            st.markdown(
+                                f'<div style="background-color: #F8FBFE; padding: 0.5rem; border-radius: 8px; text-align: center;"><div style="color: #64748b; font-size: 0.7rem; font-weight: 500; text-transform: uppercase; margin-bottom: 0.2rem;">Std Dev</div><div style="color: #1e293b; font-size: 1.3rem; font-weight: 600;">{std_fc_display}</div></div>',
+                                unsafe_allow_html=True)
                         with col3:
-                            st.markdown(f'<div style="background-color: #F8FBFE; padding: 0.5rem; border-radius: 8px; text-align: center;"><div style="color: #64748b; font-size: 0.7rem; font-weight: 500; text-transform: uppercase; margin-bottom: 0.2rem;">CV%</div><div style="color: #1e293b; font-size: 1.3rem; font-weight: 600;">{cv_display}</div></div>', unsafe_allow_html=True)
+                            st.markdown(
+                                f'<div style="background-color: #F8FBFE; padding: 0.5rem; border-radius: 8px; text-align: center;"><div style="color: #64748b; font-size: 0.7rem; font-weight: 500; text-transform: uppercase; margin-bottom: 0.2rem;">CV%</div><div style="color: #1e293b; font-size: 1.3rem; font-weight: 600;">{cv_display}</div></div>',
+                                unsafe_allow_html=True)
                         with col4:
-                            st.markdown(f'<div style="background-color: #F8FBFE; padding: 0.5rem; border-radius: 8px; text-align: center;"><div style="color: #64748b; font-size: 0.7rem; font-weight: 500; text-transform: uppercase; margin-bottom: 0.2rem;">Wells (n)</div><div style="color: #1e293b; font-size: 1.3rem; font-weight: 600;">{n_included} / {n_total}</div></div>', unsafe_allow_html=True)
-                        
-                        st.markdown('<div style="background-color: #F8FBFE; padding: 0.5rem; border-radius: 8px; margin: 0.5rem 0; border-left: 4px solid #667eea; box-shadow: 0 2px 8px rgba(0,0,0,0.04);"><span style="font-size: 0.85rem; color: #1e293b; font-weight: 500;">💡 Select Wells to Include in Analysis</span></div>', unsafe_allow_html=True)
-                        
+                            st.markdown(
+                                f'<div style="background-color: #F8FBFE; padding: 0.5rem; border-radius: 8px; text-align: center;"><div style="color: #64748b; font-size: 0.7rem; font-weight: 500; text-transform: uppercase; margin-bottom: 0.2rem;">Wells (n)</div><div style="color: #1e293b; font-size: 1.3rem; font-weight: 600;">{n_included} / {n_total}</div></div>',
+                                unsafe_allow_html=True)
+
+                        st.markdown(
+                            '<div style="background-color: #F8FBFE; padding: 0.5rem; border-radius: 8px; margin: 0.5rem 0; border-left: 4px solid #667eea; box-shadow: 0 2px 8px rgba(0,0,0,0.04);"><span style="font-size: 0.85rem; color: #1e293b; font-weight: 500;">💡 Select Wells to Include in Analysis</span></div>',
+                            unsafe_allow_html=True)
+
                         well_cols = st.columns(min(len(group), 4))
-                        
+
                         for idx, (_, row) in enumerate(group.iterrows()):
                             well = row['Well']
                             fc = row['Fold Change']
                             is_included = well not in excluded_for_label
-                            
+
                             with well_cols[idx % len(well_cols)]:
                                 if is_included:
                                     card_bg = "#F0FDF4"
@@ -2008,25 +2169,29 @@ def main():
                                     card_bg = "#F9FAFB"
                                     border_color = "#E5E7EB"
                                     status_symbol = "◇"
-                                
-                                st.markdown(f'<div style="background-color: {card_bg}; padding: 0.5rem; border-radius: 6px; border: 2px solid {border_color}; margin-bottom: 0.4rem;"><div style="font-weight: 600; color: #1e293b; margin-bottom: 0.2rem; font-size: 0.85rem;">{status_symbol} {well}</div><div style="font-size: 0.8rem; color: #64748b;">FC: <span style="font-weight: 600;">{fc:.3f}</span></div></div>', unsafe_allow_html=True)
-                                
+
+                                st.markdown(
+                                    f'<div style="background-color: {card_bg}; padding: 0.5rem; border-radius: 6px; border: 2px solid {border_color}; margin-bottom: 0.4rem;"><div style="font-weight: 600; color: #1e293b; margin-bottom: 0.2rem; font-size: 0.85rem;">{status_symbol} {well}</div><div style="font-size: 0.8rem; color: #64748b;">FC: <span style="font-weight: 600;">{fc:.3f}</span></div></div>',
+                                    unsafe_allow_html=True)
+
                                 include = st.checkbox(
                                     "Include" if is_included else "Excluded",
                                     value=is_included,
                                     key=f"include_{label}_{well}_v3",
                                     label_visibility="visible"
                                 )
-                                
+
                                 if not include and well not in st.session_state.excluded_wells[label]:
                                     st.session_state.excluded_wells[label].append(well)
                                     st.rerun()
                                 elif include and well in st.session_state.excluded_wells[label]:
                                     st.session_state.excluded_wells[label].remove(well)
                                     st.rerun()
-                        
-                        st.markdown('<div style="border-top: 1px solid #E8F4FD; padding-top: 0.5rem; margin-top: 0.5rem;"><span style="font-size: 0.8rem; color: #64748b; font-weight: 500;">QUICK ACTIONS</span></div>', unsafe_allow_html=True)
-                        
+
+                        st.markdown(
+                            '<div style="border-top: 1px solid #E8F4FD; padding-top: 0.5rem; margin-top: 0.5rem;"><span style="font-size: 0.8rem; color: #64748b; font-weight: 500;">QUICK ACTIONS</span></div>',
+                            unsafe_allow_html=True)
+
                         col1, col2 = st.columns(2)
                         with col1:
                             if st.button(f"◆ Include All Wells", key=f"include_all_{label}", use_container_width=True):
@@ -2036,88 +2201,531 @@ def main():
                             if st.button(f"◇ Exclude All Wells", key=f"exclude_all_{label}", use_container_width=True):
                                 st.session_state.excluded_wells[label] = [row['Well'] for _, row in group.iterrows()]
                                 st.rerun()
-                        
+
                         st.markdown('</div>', unsafe_allow_html=True)
-    
+
+    # EC50 Calculation Tab
     with tab4:
-        st.header("💾 Export Options")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.subheader("💾 Save Analysis")
-            st.markdown("Save your work to continue later")
-            
-            meta = {
-                'experiment_name': st.session_state.get('experiment_name', experiment_name),
-                'name_input': st.session_state.get('name_input', name_input),
-                'assay_method': st.session_state.get('assay_method', ''),
-                'transfection_direction': st.session_state.get('transfection_direction', ''),
-                'transfection_agent': st.session_state.get('transfection_agent', ''),
-                'agent_amount_ratio': st.session_state.get('agent_amount_ratio', ''),
-                'vessel_type': st.session_state.get('vessel_type', ''),
-                'methods_text': st.session_state.get('methods_text', ''),
-                'cells_seeded': st.session_state.get('cells_seeded', ''),
-                'media_volume': st.session_state.get('media_volume', ''),
-                'hrs_to_transfection': st.session_state.get('hrs_to_transfection', ''),
-                'biosensor_amount': st.session_state.get('biosensor_amount', ''),
-                'gpcr_amount': st.session_state.get('gpcr_amount', ''),
-                'hrs_to_assay': st.session_state.get('hrs_to_assay', ''),
-                'hrs_to_transfer': st.session_state.get('hrs_to_transfer', ''),
-                'cells_transferred': st.session_state.get('cells_transferred', ''),
-                'incubation_time': st.session_state.get('incubation_time', ''),
-                'notes_text': st.session_state.get('notes_text', ''),
-                'serum_free_medium': st.session_state.get('serum_free_medium', ''),
-                'dna_reagent_incubation': st.session_state.get('dna_reagent_incubation', ''),
-            }
-            
-            analysis_bytes = save_analysis_state(
-                export_df, 
-                df_pre, 
-                df_post, 
-                labels_matrix, 
-                fc_matrix, 
-                meta,
-                st.session_state.excluded_wells
-            )
-            
-            st.download_button(
-                label="💾 Save Analysis File",
-                data=analysis_bytes,
-                file_name=f"{experiment_name}_analysis.gsa",
-                mime="application/octet-stream",
-                use_container_width=True,
-                help="Save your current analysis to resume later"
-            )
-        
-        with col2:
-            st.subheader("📊 Excel Report")
-            st.markdown("Download all data in Excel format")
-            
-            excel_buffer = BytesIO()
-            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                export_df.to_excel(writer, sheet_name='Summary', index=False)
-                if replicate_df is not None:
-                    replicate_df.to_excel(writer, sheet_name='Replicates', index=False)
-                df_pre.to_excel(writer, sheet_name='Pre', index=False)
-                df_post.to_excel(writer, sheet_name='Post', index=False)
-            
-            st.download_button(
-                label="📥 Download Excel Report",
-                data=excel_buffer.getvalue(),
-                file_name=f"{experiment_name}_glosensor_analysis.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-        
-        with col3:
-            st.subheader("📄 Complete Export")
-            st.markdown("PDF report + GSA file")
-            
+        st.markdown("""
+            <div style="text-align: center; padding: 2rem 0 1.5rem 0;">
+                <h1 style="font-size: 2.2rem; font-weight: 700; 
+                           background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                           -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+                           margin: 0;">📈 EC50 Calculation</h1>
+                <p style="font-size: 1rem; color: #64748b; margin: 0.75rem 0 0 0; font-weight: 400;">
+                    Three-parameter dose-response curve fitting with automatic concentration detection
+                </p>
+            </div>
+        """, unsafe_allow_html=True)
+
+        # Initialize session state
+        if 'saved_drcs' not in st.session_state:
+            st.session_state.saved_drcs = {}
+
+        # Get all available labels
+        all_labels = sorted(export_df[export_df['Label'].str.strip() != '']['Label'].unique())
+
+        # Helper function to parse concentration from label
+        def parse_concentration_from_label(label):
+            """
+            Extract concentration from label like 'PEA_0.01nM', 'PEA_100uM', 'PEA_0.01 nM', or 'PEA_1e-9M'
+            Returns concentration in Molar (M) or None if not found
+            """
+            import re
+
+            # Pattern to match number + unit with optional space
+            pattern = r'(\d+\.?\d*(?:[eE][+-]?\d+)?)\s*(pM|pm|nM|nm|uM|um|µM|µm|mM|mm|M)(?:\s|_|$)'
+            match = re.search(pattern, label, re.IGNORECASE)
+
+            if match:
+                value = float(match.group(1))
+                unit = match.group(2).lower()
+
+                # Convert to Molar
+                if unit == 'pm':
+                    return value * 1e-12
+                elif unit == 'nm':
+                    return value * 1e-9
+                elif unit in ['um', 'µm']:
+                    return value * 1e-6
+                elif unit == 'mm':
+                    return value * 1e-3
+                elif unit == 'm':
+                    return value
+
+            return None
+
+        # Helper function to extract compound name
+        def extract_compound_name(label):
+            """Extract compound name from label like 'PEA_0.01 nM' -> 'PEA'"""
+            import re
+            parts = re.split(r'[_\s]', label)
+            return parts[0] if parts else label
+
+        # Helper function to group labels by compound
+        def group_labels_by_compound(labels):
+            """Group labels by compound name"""
+            groups = {}
+            for label in labels:
+                compound = extract_compound_name(label)
+                if compound not in groups:
+                    groups[compound] = []
+                groups[compound].append(label)
+            return groups
+
+        if len(all_labels) == 0:
+            st.warning("⚠️ No labeled wells found. Please add labels in the 'Well Labels' tab.")
+        else:
+            # Analyze labels for automatic grouping
+            compound_groups = group_labels_by_compound(all_labels)
+
+            # ========== CREATE NEW CURVE SECTION (TOP) ==========
+            st.markdown("## ➕ Create New Dose-Response Curve")
+
+            # Show detected compounds
+            st.markdown("### 🔍 Detected Compounds")
+            if len(compound_groups) > 0:
+                detected_text = ", ".join(
+                    [f"**{comp}** ({len(labels)} labels)" for comp, labels in compound_groups.items()])
+                st.info(f"💡 Found {len(compound_groups)} compound(s): {detected_text}")
+            else:
+                st.info("💡 No compound patterns detected in labels")
+
+            st.markdown("---")
+
+            # Step 1: Name the curve
+            st.markdown("### 🎯 Step 1: Name Your Curve")
+
+            col_method, col_name = st.columns([1, 2])
+
+            with col_method:
+                naming_method = st.radio(
+                    "Choose method:",
+                    ["Select detected compound", "Enter custom name"],
+                    key="naming_method"
+                )
+
+            with col_name:
+                if naming_method == "Select detected compound":
+                    if len(compound_groups) > 0:
+                        drc_name = st.selectbox(
+                            "Select compound:",
+                            options=list(compound_groups.keys()),
+                            key="compound_selector"
+                        )
+                    else:
+                        st.warning("No compounds detected. Please use custom name.")
+                        drc_name = ""
+                else:
+                    drc_name = st.text_input(
+                        "Enter curve name:",
+                        value="",
+                        placeholder="e.g., PEA, Isoproterenol, Compound X",
+                        key="custom_drc_name"
+                    )
+
+            if not drc_name:
+                st.info("👆 Please select or enter a curve name to continue")
+            elif drc_name in st.session_state.saved_drcs:
+                st.error(
+                    f"❌ A curve named '{drc_name}' already exists. Please choose a different name or delete the existing one below.")
+            else:
+                st.success(f"✅ Creating curve: **{drc_name}**")
+
+                st.markdown("---")
+
+                # Step 2: Select labels
+                st.markdown("### 🧪 Step 2: Select Labels")
+
+                # Pre-select if compound was chosen
+                if naming_method == "Select detected compound" and drc_name in compound_groups:
+                    default_labels = compound_groups[drc_name]
+                    st.info(f"💡 Auto-selected {len(default_labels)} labels matching '{drc_name}'")
+                else:
+                    default_labels = []
+
+                st.markdown("**Available Labels:**")
+                if len(all_labels) <= 20:
+                    st.caption(", ".join(all_labels))
+                else:
+                    st.caption(f"{len(all_labels)} labels available")
+
+                selected_labels = st.multiselect(
+                    "Select labels for this curve:",
+                    options=all_labels,
+                    default=default_labels,
+                    help="Choose all concentrations of the same compound",
+                    key=f"labels_{drc_name}"
+                )
+
+                if len(selected_labels) < 3:
+                    st.warning(f"⚠️ Please select at least 3 labels. Currently selected: {len(selected_labels)}")
+                else:
+                    st.success(f"✅ {len(selected_labels)} labels selected")
+
+                    # Preview
+                    st.markdown("#### 📊 Preview")
+                    preview_data = []
+                    for label in selected_labels:
+                        wells_data = export_df[export_df['Label'] == label]
+                        excluded = st.session_state.excluded_wells.get(label, [])
+                        wells_data = wells_data[~wells_data['Well'].isin(excluded)]
+
+                        if len(wells_data) > 0:
+                            preview_data.append({
+                                'Label': label,
+                                'Wells': ', '.join(wells_data['Well'].tolist()),
+                                'n': len(wells_data),
+                                'Mean FC': f"{wells_data['Fold Change'].mean():.3f}"
+                            })
+
+                    if preview_data:
+                        preview_df = pd.DataFrame(preview_data)
+                        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+                    st.markdown("---")
+
+                    # Step 3: Concentrations
+                    st.markdown("### 🎯 Step 3: Assign Concentrations")
+
+                    # Try auto-detection
+                    auto_detected = {}
+                    for label in selected_labels:
+                        conc = parse_concentration_from_label(label)
+                        if conc:
+                            auto_detected[label] = conc
+
+                    # Show auto-detection status
+                    if len(auto_detected) == len(selected_labels):
+                        st.success(f"🎉 Auto-detected all {len(auto_detected)} concentrations from label names!")
+                    elif len(auto_detected) > 0:
+                        st.warning(
+                            f"⚠️ Auto-detected {len(auto_detected)}/{len(selected_labels)} concentrations. Please verify and fill missing values.")
+                    else:
+                        st.info("💡 No concentrations detected. Please enter manually.")
+
+                    st.markdown("""
+                        <div style="background: #e0f2fe; padding: 0.75rem; border-radius: 8px; border-left: 3px solid #0284c7; margin: 1rem 0;">
+                            <strong>📝 Instructions:</strong> Enter log concentration for each label. Auto-detected values are pre-filled but can be edited.
+                            <br><strong>Examples:</strong> -9 for 1 nM, -6 for 1 µM, -3 for 1 mM
+                        </div>
+                    """, unsafe_allow_html=True)
+
+                    concentration_map = {}
+
+                    # Create editable inputs for all labels
+                    cols_per_row = 3
+                    for idx in range(0, len(selected_labels), cols_per_row):
+                        cols = st.columns(cols_per_row)
+
+                        for col_idx, label in enumerate(selected_labels[idx:idx + cols_per_row]):
+                            with cols[col_idx]:
+                                # Check if auto-detected
+                                if label in auto_detected:
+                                    default_log = np.log10(auto_detected[label])
+                                    detected_conc = auto_detected[label]
+
+                                    if detected_conc < 1e-9:
+                                        detected_str = f"{detected_conc * 1e12:.3g} pM"
+                                    elif detected_conc < 1e-6:
+                                        detected_str = f"{detected_conc * 1e9:.3g} nM"
+                                    elif detected_conc < 1e-3:
+                                        detected_str = f"{detected_conc * 1e6:.3g} µM"
+                                    else:
+                                        detected_str = f"{detected_conc * 1e3:.3g} mM"
+
+                                    st.markdown(f"**{label}** ✓")
+                                    st.caption(f"🔍 Detected: {detected_str}")
+                                else:
+                                    default_log = -9.0
+                                    st.markdown(f"**{label}** ✏️")
+                                    st.caption("⚠️ Not detected - enter manually")
+
+                                log_conc_input = st.number_input(
+                                    "Log [M]:",
+                                    min_value=-12.0,
+                                    max_value=-3.0,
+                                    value=float(default_log),
+                                    step=0.5,
+                                    format="%.1f",
+                                    key=f"conc_{drc_name}_{label}",
+                                    label_visibility="collapsed"
+                                )
+
+                                conc_M = 10 ** log_conc_input
+                                concentration_map[label] = conc_M
+
+                                # Show converted value
+                                if conc_M < 1e-9:
+                                    readable = f"{conc_M * 1e12:.3g} pM"
+                                elif conc_M < 1e-6:
+                                    readable = f"{conc_M * 1e9:.3g} nM"
+                                elif conc_M < 1e-3:
+                                    readable = f"{conc_M * 1e6:.3g} µM"
+                                else:
+                                    readable = f"{conc_M * 1e3:.3g} mM"
+
+                                st.caption(f"→ {readable} ({conc_M:.2e} M)")
+
+                    st.markdown("---")
+
+                    # Step 4: Calculate
+                    st.markdown("### 📐 Step 4: Calculate EC50")
+
+                    # Show concentration range
+                    conc_values = sorted(concentration_map.values())
+                    min_conc = conc_values[0]
+                    max_conc = conc_values[-1]
+
+                    if min_conc < 1e-9:
+                        min_str = f"{min_conc * 1e12:.3g} pM"
+                    elif min_conc < 1e-6:
+                        min_str = f"{min_conc * 1e9:.3g} nM"
+                    elif min_conc < 1e-3:
+                        min_str = f"{min_conc * 1e6:.3g} µM"
+                    else:
+                        min_str = f"{min_conc * 1e3:.3g} mM"
+
+                    if max_conc < 1e-9:
+                        max_str = f"{max_conc * 1e12:.3g} pM"
+                    elif max_conc < 1e-6:
+                        max_str = f"{max_conc * 1e9:.3g} nM"
+                    elif max_conc < 1e-3:
+                        max_str = f"{max_conc * 1e6:.3g} µM"
+                    else:
+                        max_str = f"{max_conc * 1e3:.3g} mM"
+
+                    st.success(
+                        f"✅ Ready! Concentration range: {min_str} to {max_str} ({len(concentration_map)} points)")
+
+                    if st.button("🚀 Calculate & Save EC50", type="primary", use_container_width=True,
+                                 key=f"calc_{drc_name}"):
+                        with st.spinner("Fitting dose-response curve..."):
+                            final_concentrations = []
+                            final_responses = []
+                            data_table = []
+
+                            for label, conc_M in sorted(concentration_map.items(), key=lambda x: x[1]):
+                                wells_data = export_df[export_df['Label'] == label]
+                                excluded = st.session_state.excluded_wells.get(label, [])
+                                wells_data = wells_data[~wells_data['Well'].isin(excluded)]
+
+                                if len(wells_data) > 0:
+                                    mean_fc = wells_data['Fold Change'].mean()
+                                    final_concentrations.append(conc_M)
+                                    final_responses.append(mean_fc)
+                                    data_table.append({
+                                        'Concentration (M)': f"{conc_M:.3e}",
+                                        'Label': label,
+                                        'n': len(wells_data),
+                                        'Mean FC': mean_fc
+                                    })
+
+                            conc_arr = np.array(final_concentrations)
+                            resp_arr = np.array(final_responses)
+
+                            ec50, log_ec50, top, bottom, r2, params, success = fit_dose_response_curve(
+                                conc_arr, resp_arr
+                            )
+
+                            if success:
+                                st.session_state.saved_drcs[drc_name] = {
+                                    'ec50': ec50,
+                                    'log_ec50': log_ec50,
+                                    'top': top,
+                                    'bottom': bottom,
+                                    'r_squared': r2,
+                                    'fit_params': params,
+                                    'concentrations': conc_arr,
+                                    'responses': resp_arr,
+                                    'data_table': data_table,
+                                    'compound_labels': selected_labels,
+                                    'concentration_map': concentration_map
+                                }
+                                st.success(f"✅ Curve '{drc_name}' saved successfully!")
+                                st.balloons()
+                                st.rerun()
+                            else:
+                                st.error("❌ Curve fitting failed. Check your data and try again.")
+
+            # ========== SAVED CURVES SECTION (BOTTOM) ==========
+            if st.session_state.saved_drcs:
+                st.markdown("---")
+                st.markdown("---")
+                st.markdown("## 📊 Saved Dose-Response Curves")
+
+                # Show detailed view if selected
+                if 'viewing_drc' in st.session_state and st.session_state['viewing_drc'] in st.session_state.saved_drcs:
+                    viewing_name = st.session_state['viewing_drc']
+                    results = st.session_state.saved_drcs[viewing_name]
+
+                    col_title, col_close = st.columns([4, 1])
+                    with col_title:
+                        st.markdown(f"### 📊 Viewing: {viewing_name}")
+                    with col_close:
+                        if st.button("✕ Close", use_container_width=True, key="close_detail"):
+                            del st.session_state['viewing_drc']
+                            st.rerun()
+
+                    # Larger centered plot
+                    col1, col2, col3 = st.columns([1, 2, 1])
+                    with col2:
+                        fig = plot_dose_response_curve_compact(
+                            results['concentrations'],
+                            results['responses'],
+                            fit_params=results['fit_params'],
+                            ec50=results['ec50'],
+                            width=5,
+                            height=3.5
+                        )
+                        st.pyplot(fig, use_container_width=False)
+                        plt.close(fig)
+
+                    # Data table
+                    st.markdown("#### 📋 Dose-Response Data")
+                    data_df = pd.DataFrame(results['data_table'])
+                    st.dataframe(data_df, use_container_width=True, hide_index=True)
+
+                    # Summary table
+                    st.markdown("#### 📊 Curve Fit Parameters")
+                    summary_params_df = pd.DataFrame({
+                        'Parameter': ['EC50 (M)', 'pEC50 (-log10 EC50)', 'Top', 'Bottom', 'Hill Slope', 'R²',
+                                      'N (concentrations)'],
+                        'Value': [
+                            f"{results['ec50']:.3e}",
+                            f"{-results['log_ec50']:.2f}",
+                            f"{results['top']:.3f}",
+                            f"{results['bottom']:.3f}",
+                            "1.0 (fixed)",
+                            f"{results['r_squared']:.4f}",
+                            f"{len(results['concentrations'])}"
+                        ]
+                    })
+                    st.dataframe(summary_params_df, use_container_width=True, hide_index=True)
+
+                    st.markdown("---")
+
+                # Display curves in grid
+                num_curves = len(st.session_state.saved_drcs)
+                cols_per_row = 3
+                drc_names = list(st.session_state.saved_drcs.keys())
+
+                for idx in range(0, len(drc_names), cols_per_row):
+                    cols = st.columns(cols_per_row)
+
+                    for col_idx, drc_name in enumerate(drc_names[idx:idx + cols_per_row]):
+                        with cols[col_idx]:
+                            results = st.session_state.saved_drcs[drc_name]
+
+                            # Format EC50
+                            ec50_val = results['ec50']
+                            if ec50_val < 1e-9:
+                                ec50_display = f"{ec50_val * 1e12:.2f} pM"
+                            elif ec50_val < 1e-6:
+                                ec50_display = f"{ec50_val * 1e9:.2f} nM"
+                            elif ec50_val < 1e-3:
+                                ec50_display = f"{ec50_val * 1e6:.2f} µM"
+                            else:
+                                ec50_display = f"{ec50_val * 1e3:.2f} mM"
+
+                            # Card header
+                            st.markdown(f"""
+                                <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                                            padding: 0.75rem; border-radius: 8px 8px 0 0; text-align: center;">
+                                    <strong style="font-size: 1rem; color: white;">{drc_name}</strong><br>
+                                    <span style="font-size: 0.85rem; color: rgba(255,255,255,0.9);">
+                                        EC50: {ec50_display}
+                                    </span>
+                                </div>
+                            """, unsafe_allow_html=True)
+
+                            # Plot
+                            fig = plot_dose_response_curve_compact(
+                                results['concentrations'],
+                                results['responses'],
+                                fit_params=results['fit_params'],
+                                ec50=results['ec50'],
+                                width=4,
+                                height=3
+                            )
+                            st.pyplot(fig, use_container_width=True)
+                            plt.close(fig)
+
+                            # Stats footer
+                            st.markdown(f"""
+                                <div style="background: #f8fafc; padding: 0.5rem; border-radius: 0 0 8px 8px; 
+                                            font-size: 0.8rem; text-align: center; border: 1px solid #e2e8f0;">
+                                    <strong>R²:</strong> {results['r_squared']:.4f} | 
+                                    <strong>n:</strong> {len(results['concentrations'])}
+                                </div>
+                            """, unsafe_allow_html=True)
+
+                            # Prominent buttons
+                            col_view, col_delete = st.columns(2)
+                            with col_view:
+                                if st.button("👁️ View Details", key=f"view_{drc_name}", use_container_width=True,
+                                             type="secondary"):
+                                    st.session_state['viewing_drc'] = drc_name
+                                    st.rerun()
+                            with col_delete:
+                                if st.button("🗑️ Delete", key=f"delete_{drc_name}", use_container_width=True):
+                                    del st.session_state.saved_drcs[drc_name]
+                                    if st.session_state.get('viewing_drc') == drc_name:
+                                        del st.session_state['viewing_drc']
+                                    st.rerun()
+
+                st.markdown("---")
+
+                # Comparison table
+                st.markdown("### 📋 EC50 Comparison Table")
+                comparison_data = []
+                for drc_name, results in st.session_state.saved_drcs.items():
+                    ec50_val = results['ec50']
+                    if ec50_val < 1e-9:
+                        ec50_display = f"{ec50_val * 1e12:.2f} pM"
+                    elif ec50_val < 1e-6:
+                        ec50_display = f"{ec50_val * 1e9:.2f} nM"
+                    elif ec50_val < 1e-3:
+                        ec50_display = f"{ec50_val * 1e6:.2f} µM"
+                    else:
+                        ec50_display = f"{ec50_val * 1e3:.2f} mM"
+
+                    comparison_data.append({
+                        'Compound': drc_name,
+                        'EC50': ec50_display,
+                        'EC50 (M)': f"{results['ec50']:.3e}",
+                        'pEC50': f"{-results['log_ec50']:.2f}",
+                        'Top': f"{results['top']:.3f}",
+                        'Bottom': f"{results['bottom']:.3f}",
+                        'R²': f"{results['r_squared']:.4f}",
+                        'N': len(results['concentrations'])
+                    })
+
+                comparison_df = pd.DataFrame(comparison_data)
+                st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+        with tab5:
+            st.header("💾 Export Options")
+
+            st.markdown("""
+                <div style="text-align: center; padding: 2rem 0 1.5rem 0;">
+                    <h1 style="font-size: 2.2rem; font-weight: 700; 
+                               background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                               -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+                               margin: 0;">📦 Complete Analysis Package</h1>
+                    <p style="font-size: 1rem; color: #64748b; margin: 0.75rem 0 0 0; font-weight: 400;">
+                        Download everything in one package (ZIP file)
+                    </p>
+                </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown("### 📋 Complete Analysis Export Package")
+            st.markdown("*All files bundled together: PDF report, GSA analysis file, and Excel data exports*")
+
             # Check required fields based on method
             assay_method = st.session_state.get('assay_method', 'Direct method')
             transfection_direction = st.session_state.get('transfection_direction', '')
-            
+
             base_fields = [
                 st.session_state.get('assay_method'),
                 st.session_state.get('transfection_direction'),
@@ -2130,11 +2738,11 @@ def main():
                 st.session_state.get('serum_free_medium'),
                 st.session_state.get('dna_reagent_incubation'),
             ]
-            
+
             # Add media_volume check for Forward transfection
             if transfection_direction == "Forward transfection":
                 base_fields.append(st.session_state.get('media_volume'))
-            
+
             if assay_method == "Transfer method":
                 required_fields_filled = all(base_fields + [
                     st.session_state.get('vessel_type'),
@@ -2146,24 +2754,28 @@ def main():
                 required_fields_filled = all(base_fields + [
                     st.session_state.get('hrs_to_assay')
                 ])
-            
+
             if not required_fields_filled:
                 st.warning("⚠️ Please fill in all required parameters in the Setup tab")
-                st.button("📥 Generate Export", disabled=True, use_container_width=True)
+                st.button("📦 Generate Complete Package", disabled=True, use_container_width=True)
             else:
-                st.info("💡 All selections captured in both files")
-                
-                if st.button("📥 Generate Export", use_container_width=True, type="primary"):
-                    with st.spinner("Generating export package..."):
+                st.info("💡 Package will include: PDF report, GSA file, Summary data, and Complete data")
+
+                if st.button("📦 Generate Complete Package", use_container_width=True, type="primary"):
+                    with st.spinner("Generating complete package..."):
                         try:
+                            import zipfile
+                            from datetime import datetime
+
+                            # Generate all files
                             kinetics_path = create_individual_well_kinetics(df_pre, df_post, labels_matrix, fc_matrix)
                             heatmap_path = create_fold_change_heatmap(fc_matrix, labels_matrix)
-                            
+
                             fig_files_info = [
                                 ("Fold Change Heatmap", heatmap_path),
                                 ("Individual Well Kinetics (96-Well Format)", kinetics_path)
                             ]
-                            
+
                             meta = {
                                 'experiment_name': st.session_state.get('experiment_name', experiment_name),
                                 'name_input': st.session_state.get('name_input', name_input),
@@ -2188,74 +2800,128 @@ def main():
                                 'replicate_df': replicate_df,
                                 'excluded_wells': st.session_state.excluded_wells
                             }
-                            
+
+                            # Generate PDF
                             pdf_bytes = generate_pdf_bytes(
                                 fig_files_info, labels_matrix, fc_matrix,
                                 export_df, df_pre, df_post, meta
                             )
-                            
+
+                            # Generate GSA (analysis state)
                             analysis_bytes = save_analysis_state(
-                                export_df, 
-                                df_pre, 
-                                df_post, 
-                                labels_matrix, 
-                                fc_matrix, 
+                                export_df,
+                                df_pre,
+                                df_post,
+                                labels_matrix,
+                                fc_matrix,
                                 meta,
                                 st.session_state.excluded_wells
                             )
-                            
+
+                            # Generate Excel files
+                            summary_buffer = BytesIO()
+                            with pd.ExcelWriter(summary_buffer, engine='openpyxl') as writer:
+                                export_df.to_excel(writer, sheet_name='Summary', index=False)
+                                if replicate_df is not None:
+                                    replicate_df.to_excel(writer, sheet_name='Replicates', index=False)
+                            summary_buffer.seek(0)
+
+                            complete_buffer = BytesIO()
+                            with pd.ExcelWriter(complete_buffer, engine='openpyxl') as writer:
+                                export_df.to_excel(writer, sheet_name='Summary', index=False)
+                                if replicate_df is not None:
+                                    replicate_df.to_excel(writer, sheet_name='Replicates', index=False)
+                                df_pre.to_excel(writer, sheet_name='Pre', index=False)
+                                df_post.to_excel(writer, sheet_name='Post', index=False)
+                            complete_buffer.seek(0)
+
+                            # Create ZIP package
+                            zip_buffer = BytesIO()
+                            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                                # Add PDF report
+                                zip_file.writestr(f"{experiment_name}_report.pdf", pdf_bytes)
+
+                                # Add GSA file
+                                zip_file.writestr(f"{experiment_name}_analysis.gsa", analysis_bytes)
+
+                                # Add Excel files
+                                zip_file.writestr(f"{experiment_name}_summary.xlsx", summary_buffer.getvalue())
+                                zip_file.writestr(f"{experiment_name}_complete_data.xlsx", complete_buffer.getvalue())
+
+                                # Add metadata file
+                                metadata_text = f"""GloSensor Analysis Report
+    Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+    Experiment: {experiment_name}
+    Investigator: {st.session_state.get('name_input', 'N/A')}
+
+    Assay Method: {assay_method}
+    Transfection Direction: {transfection_direction}
+
+    Files included in this package:
+    1. {experiment_name}_report.pdf - Complete PDF report with all figures and analysis
+    2. {experiment_name}_analysis.gsa - Analysis state file (load to resume work in the application)
+    3. {experiment_name}_summary.xlsx - Summary data (fold change by well + replicate analysis)
+    4. {experiment_name}_complete_data.xlsx - Complete data (all raw kinetics + summary + replicates)
+    """
+                                zip_file.writestr("README.txt", metadata_text)
+
+                            zip_buffer.seek(0)
+
+                            # Clean up temporary files
                             try:
                                 os.unlink(kinetics_path)
                                 os.unlink(heatmap_path)
                             except:
                                 pass
-                            
-                            if pdf_bytes:
-                                st.success("✨ Export generated successfully!")
-                                
-                                st.markdown("""
-                                    <div style="background: linear-gradient(135deg, #E8F5E9 0%, #C8E6C9 100%); 
-                                                padding: 1rem; border-radius: 10px; margin: 1rem 0; 
-                                                border-left: 4px solid #4CAF50; text-align: center;">
-                                        <h3 style="color: #2E7D32; margin: 0 0 0.5rem 0; font-size: 1.1rem;">
-                                            ✅ Your files are ready to download!
-                                        </h3>
-                                        <p style="color: #388E3C; margin: 0; font-size: 0.9rem;">
-                                            Click the buttons below to save your files
-                                        </p>
-                                    </div>
-                                """, unsafe_allow_html=True)
-                                
-                                col_pdf, col_gsa = st.columns(2)
-                                with col_pdf:
-                                    st.markdown("**📄 Complete PDF Report**")
-                                    st.download_button(
-                                        label="⬇️ Download PDF Report",
-                                        data=pdf_bytes,
-                                        file_name=f"{experiment_name}_report.pdf",
-                                        mime="application/pdf",
-                                        use_container_width=True,
-                                        type="primary"
-                                    )
-                                    st.caption("Complete analysis with all figures and data")
-                                
-                                with col_gsa:
-                                    st.markdown("**💾 Analysis Save File**")
-                                    st.download_button(
-                                        label="⬇️ Download GSA File",
-                                        data=analysis_bytes,
-                                        file_name=f"{experiment_name}_analysis.gsa",
-                                        mime="application/octet-stream",
-                                        use_container_width=True,
-                                        help="Save to resume later"
-                                    )
-                                    st.caption("Load this file to continue your work later")
-                            else:
-                                st.error("Failed to generate export")
+
+                            st.success("✨ Complete package generated successfully!")
+
+                            st.markdown("""
+                                <div style="background: linear-gradient(135deg, #E8F5E9 0%, #C8E6C9 100%); 
+                                            padding: 1rem; border-radius: 10px; margin: 1rem 0; 
+                                            border-left: 4px solid #4CAF50; text-align: center;">
+                                    <h3 style="color: #2E7D32; margin: 0 0 0.5rem 0; font-size: 1.1rem;">
+                                        ✅ Your complete package is ready!
+                                    </h3>
+                                    <p style="color: #388E3C; margin: 0; font-size: 0.9rem;">
+                                        All files bundled in one ZIP file
+                                    </p>
+                                </div>
+                            """, unsafe_allow_html=True)
+
+                            st.download_button(
+                                label="📥 Download Complete Package (ZIP)",
+                                data=zip_buffer.getvalue(),
+                                file_name=f"{experiment_name}_complete_package.zip",
+                                mime="application/zip",
+                                use_container_width=True,
+                                type="primary"
+                            )
+
+                            st.markdown("""
+                                <div style="background: #f0f9ff; padding: 1rem; border-radius: 10px; margin: 1rem 0; 
+                                            border-left: 4px solid #0284c7;">
+                                    <strong style="color: #1e293b;">📦 Package Contents:</strong>
+                                    <ul style="color: #475569; margin: 0.5rem 0 0 1rem;">
+                                        <li><strong>PDF Report</strong> - Professional analysis report with figures</li>
+                                        <li><strong>GSA File</strong> - Save file to continue analysis in the app</li>
+                                        <li><strong>Summary Data</strong> - Fold change by well + replicate analysis</li>
+                                        <li><strong>Complete Data</strong> - All raw kinetics and summary</li>
+                                        <li><strong>README</strong> - Package information and contents</li>
+                                    </ul>
+                                </div>
+                            """, unsafe_allow_html=True)
+
                         except Exception as e:
-                            st.error(f"Error generating files: {e}")
+                            st.error(f"Error generating package: {e}")
                             import traceback
                             st.code(traceback.format_exc())
+
+            st.markdown("---")
+
+
+
 
 if __name__ == "__main__":
     main()
